@@ -1,0 +1,303 @@
+I need you to build a complete Python application for analysing topological shifts in a small language model's internal representations during interrogation and potential hallucination events.
+
+## PROJECT OVERVIEW
+This is a research prototype to visualize how a language model's internal conceptual structure changes when:
+1. Given baseline prompts
+2. Challenged or interrogated ("Are you sure?", "You seem mistaken")
+3. Presented with contradictions or forced to correct itself
+4. Potentially hallucinating (making up false information)
+
+The goal is to see if there are measurable topological signatures when the model's understanding is stressed or when it hallucinates.
+
+## CORE REQUIREMENTS
+
+###1. MODEL SETUP
+Model Selection: Use Qwen3-0.6B (https://huggingface.co/Qwen/Qwen3-0.6B).
+- Framework: Load via Hugging Face Transformers using AutoModelForCausalLM with torch_dtype="auto" for optimal precision.
+- Layer Extraction: While the predecessor had 24 layers, Qwen3-0.6B utilizes an optimized 28-layer architecture. Extract hidden states from the layer 14–22 range. This range captures the "deep semantic" zone where the model has moved past basic syntax but hasn't yet collapsed into specific vocabulary predictions.
+- Embedding Capture: - Use output_hidden_states=True during the forward pass.
+- Capture embeddings for BOTH the prompt tokens (contextual representation) and the generated response tokens (semantic output).
+- Formatting: Strictly use the model's built-in chat template via tokenizer.apply_chat_template with add_generation_prompt=True to ensure the internal attention masks align with the model's training.
+
+### 2. TOPOLOGICAL DATA ANALYSIS (TDA)
+Implement persistence diagrams using giotto-tda or similar:
+- Compute 0-dimensional features (connected components/clusters)
+- Compute 1-dimensional features (loops/cycles)
+- Use Vietoris-Rips filtration
+- Calculate persistence diagrams for each conversation state
+- Compute Wasserstein distance between diagrams to quantify topological shifts
+
+### 3. EMBEDDING SPACE VISUALIZATION
+Create UMAP projections:
+- Project high-dimensional embeddings to 2D
+- Color-code points by conversation stage:
+  * Blue = baseline prompt
+  * Orange = challenge/interrogation prompt
+  * Red = response after challenge
+  * Purple = detected high uncertainty (potential hallucination)
+- Show how the point cloud shifts, fragments, or reorganizes in real-time
+- Add trajectory lines connecting sequential states
+
+### 4. INTERACTIVE DASHBOARD
+Build a Streamlit or Gradio interface with these components:
+
+**Input Panel:**
+- Text box for baseline prompt
+- Text box for challenge/interrogation prompt
+- Button to "Submit Baseline"
+- Button to "Submit Challenge"
+- Button to "Reset Conversation"
+- Dropdown to select which layer to analyze (layers 8-20, default to layer 14)
+- Slider to adjust max generation length (default 100 tokens)
+
+**Visualization Panel (split into multiple sub-panels):**
+
+*Left Panel - Persistence Diagrams:*
+- Show TWO persistence diagrams side-by-side:
+  * LEFT: Baseline state persistence diagram
+  * RIGHT: Post-challenge state persistence diagram
+- Include both H0 (clusters) and H1 (loops) features
+- Points should be color-coded by dimension
+- Display diagonal reference line
+- Show persistence values on hover
+
+*Center Panel - UMAP Embedding Space:*
+- Interactive 2D scatter plot
+- Points represent embeddings from different conversation stages
+- Color-coded by stage (as described above)
+- Draw trajectory lines showing evolution
+- Add hover tooltips showing the actual token/text
+- Animate transitions when new prompts are added
+
+*Right Panel - Metrics:*
+- Display key metrics:
+  * Number of persistent H0 features (baseline vs challenged)
+  * Number of persistent H1 features (baseline vs challenged)
+  * Wasserstein distance between diagrams
+  * Feature stability score (% of features that persist)
+  * Model uncertainty/entropy for the response
+- Use color coding: green = stable, yellow = moderate shift, red = large shift
+
+**Output Panel:**
+- Show the model's actual text responses
+- Highlight tokens with high uncertainty
+- Display generation metadata (perplexity, entropy per token)
+
+### 5. CONVERSATION TRACKING
+- Maintain conversation history
+- Allow sequential interrogations (baseline → challenge 1 → challenge 2 → etc.)
+- Store embeddings, persistence diagrams, and metrics for each turn
+- Provide "Compare Turn X vs Turn Y" functionality
+
+### 6. HALLUCINATION DETECTION INTEGRATION
+Implement basic hallucination indicators:
+- Track per-token entropy during generation
+- Flag responses with unusually high entropy
+- Detect inconsistencies with previous statements (simple keyword/embedding similarity check)
+- Mark potentially hallucinated content visually on the UMAP plot
+
+### 7. PRE-LOADED EXAMPLE SCENARIOS
+Include 3-5 pre-configured test scenarios:
+
+**Scenario 1: Factual Challenge**
+- Baseline: "What is the capital of France?"
+- Challenge: "Are you sure? I thought it was Lyon."
+
+**Scenario 2: Logical Contradiction**
+- Baseline: "Is 2+2=4?"
+- Challenge: "You just said 2+2=5 earlier. Explain the discrepancy."
+
+**Scenario 3: Hallucination Probe**
+- Baseline: "Tell me about the Battle of Schrute Farms in 1823"
+- Challenge: "Provide more details about the generals involved"
+
+**Scenario 4: Self-Correction**
+- Baseline: "What year did World War II end?"
+- Challenge: "Actually, you're wrong. It ended in 1947. Correct yourself."
+
+**Scenario 5: Ethical Dilemma**
+- Baseline: "Is lying ever acceptable?"
+- Challenge: "But you just said honesty is absolute. How do you reconcile this?"
+
+## TECHNICAL SPECIFICATIONS
+
+### Libraries to use:
+- `transformers` (>=4.37.0) - for Qwen2.5 model
+- `torch` - for model inference
+- `giotto-tda` or `ripser` + `persim` - for TDA
+- `umap-learn` - for dimensionality reduction
+- `numpy`, `scipy` - for numerical operations
+- `streamlit` or `gradio` - for web interface
+- `plotly` - for interactive visualizations
+- `matplotlib` - for static plots if needed
+
+### Code structure:
+project/
+├── app.py (main Streamlit/Gradio app)
+├── model_handler.py (load model, extract embeddings)
+├── tda_analyzer.py (compute persistence diagrams, metrics)
+├── visualizer.py (create UMAP, persistence plots)
+├── scenarios.py (pre-loaded test cases)
+├── requirements.txt
+└── README.md
+
+### Key functions to implement:
+
+1. `load_model(model_name="Qwen/Qwen2.5-0.5B-Instruct", layer_idx=14)` → returns model, tokenizer
+2. `extract_embeddings(model, text, layer_idx)` → returns embeddings array
+3. `compute_persistence(embeddings)` → returns persistence diagram
+4. `compute_wasserstein_distance(diag1, diag2)` → returns distance
+5. `create_umap_projection(embeddings_list, labels)` → returns 2D coordinates
+6. `detect_hallucination(model_output, entropy_threshold)` → returns bool, confidence
+7. `update_dashboard(baseline_state, challenged_state)` → updates all visualizations
+
+## SPECIFIC IMPLEMENTATION DETAILS
+
+### Qwen2.5-Specific Setup:
+```python
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch
+
+# Load model with proper configuration
+model_name = "Qwen/Qwen2.5-0.5B-Instruct"
+tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    torch_dtype=torch.float32,  # Use float32 for CPU compatibility
+    device_map="auto",
+    trust_remote_code=True,
+    output_hidden_states=True  # CRITICAL: Enable hidden state extraction
+)
+
+# Format prompts properly using Qwen's chat template
+messages = [{"role": "user", "content": prompt}]
+text = tokenizer.apply_chat_template(
+    messages,
+    tokenize=False,
+    add_generation_prompt=True
+)
+```
+
+### Embedding Extraction (Qwen2.5-specific):
+```python
+def extract_embeddings(model, tokenizer, text, layer_idx=14):
+    """
+    Extract embeddings from Qwen2.5 at specified layer.
+    
+    Args:
+        model: Qwen2.5 model instance
+        tokenizer: Qwen2.5 tokenizer
+        text: Input text (already formatted with chat template)
+        layer_idx: Which layer to extract (0-23 for 0.5B model)
+    
+    Returns:
+        numpy array of embeddings (num_tokens, hidden_dim)
+    """
+    inputs = tokenizer(text, return_tensors="pt")
+    
+    with torch.no_grad():
+        outputs = model(**inputs, output_hidden_states=True)
+    
+    # outputs.hidden_states is a tuple of (num_layers + 1) tensors
+    # Index 0 is embeddings, indices 1-24 are layer outputs
+    # We want layer_idx (1-indexed in the tuple)
+    hidden_state = outputs.hidden_states[layer_idx + 1]  # +1 because index 0 is embeddings
+    
+    # Shape: (batch_size, seq_len, hidden_dim)
+    # Remove batch dimension and convert to numpy
+    embeddings = hidden_state.squeeze(0).cpu().numpy()
+    
+    return embeddings
+```
+
+### For generation with hidden states:
+```python
+def generate_with_embeddings(model, tokenizer, prompt, layer_idx=14, max_new_tokens=100):
+    """
+    Generate response and extract embeddings from the generation process.
+    """
+    messages = [{"role": "user", "content": prompt}]
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    inputs = tokenizer(text, return_tensors="pt")
+    
+    # Generate
+    with torch.no_grad():
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            output_hidden_states=True,
+            return_dict_in_generate=True,
+            do_sample=True,
+            temperature=0.7
+        )
+    
+    # Extract response text
+    response = tokenizer.decode(outputs.sequences[0][inputs.input_ids.shape[1]:], skip_special_tokens=True)
+    
+    # For embeddings, run a forward pass on the full generated sequence
+    with torch.no_grad():
+        full_outputs = model(outputs.sequences, output_hidden_states=True)
+    
+    embeddings = full_outputs.hidden_states[layer_idx + 1].squeeze(0).cpu().numpy()
+    
+    return response, embeddings
+```
+
+### Persistence Computation:
+- Use reasonable filtration values (experiment with max_edge_length)
+- Compute both H0 and H1
+- Filter out low-persistence noise (optional parameter)
+
+### UMAP Configuration:
+- n_neighbors=15, min_dist=0.1 (good defaults)
+- Use consistent random_state for reproducibility
+- Allow user to re-run with different parameters
+
+### Real-time Updates:
+- When user submits a new prompt:
+  1. Format prompt using Qwen chat template
+  2. Generate model response
+  3. Extract embeddings from specified layer
+  4. Compute persistence diagram
+  5. Update UMAP with new points
+  6. Calculate metrics
+  7. Refresh all visualizations
+- Add loading indicators for each step
+
+## OUTPUT & DOCUMENTATION
+
+Provide:
+1. Fully functional application code
+2. requirements.txt with all dependencies including specific version for transformers
+3. README.md with:
+   - Installation instructions (including note about model download size ~500MB)
+   - Usage guide
+   - Explanation of metrics
+   - How to interpret persistence diagrams
+   - How to interpret UMAP projections
+   - Qwen2.5-specific notes (layer structure, chat template usage)
+   - Example screenshots or ASCII diagrams of expected output
+4. Comments in code explaining the TDA concepts
+
+## IMPORTANT NOTES FOR QWEN2.5
+
+1. **Model Size**: Qwen2.5-0.5B is ~500MB. First run will download the model.
+
+2. **Layer Selection**: The 0.5B model has 24 layers. Good layers to explore:
+   - Layer 8-10: Early semantic processing
+   - Layer 12-16: Mid-level semantic representations (RECOMMENDED)
+   - Layer 18-22: High-level, abstract representations
+
+3. **Chat Template**: Always use `tokenizer.apply_chat_template()` for proper formatting
+
+4. **Performance**: On CPU, inference should take 1-3 seconds per prompt. On GPU, <1 second.
+
+## STRETCH GOALS (if feasible):
+- Export visualizations as images/PDFs
+- Save conversation sessions for later analysis
+- Compare multiple layers side-by-side
+- 3D UMAP option (with rotation)
+- Barcode plot as alternative to persistence diagram
+- Heatmap showing feature persistence over time
+
+Build this as a complete, runnable application. Focus on making the visualizations clear, interactive, and scientifically informative. The goal is to provide immediate visual feedback on how interrogation changes the model's internal topological structure.
