@@ -1,0 +1,27 @@
+# Topological Shifts Under Pressure — dependencies
+#
+# Install with:  pip install -r requirements.txt
+#
+# For GPU support install PyTorch with CUDA separately first:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+
+# Model & inference
+torch>=2.1.0
+transformers>=4.51.0
+
+# TDA (topological data analysis)
+ripser>=0.6.4
+persim>=0.3.2
+
+# Dimensionality reduction
+umap-learn>=0.5.5
+
+# Visualisation & UI
+gradio>=4.44.0
+plotly>=5.18.0
+
+# Numerical / data
+numpy>=1.24.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+pandas>=2.0.0
