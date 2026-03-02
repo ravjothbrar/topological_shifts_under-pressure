@@ -1,5 +1,5 @@
 """
-Model handler for Qwen3-0.6B.
+Model handler for Qwen3.5-9B.
 
 Responsible for:
 - Loading the model and tokenizer from Hugging Face.
@@ -8,8 +8,17 @@ Responsible for:
 - Generating text while capturing per-token entropy for hallucination
   detection.
 
-Qwen3-0.6B has 28 transformer layers.  The recommended analysis range
-is layers 14-22 (deep semantic zone).
+Qwen3.5-9B has 32 transformer layers and a hidden dimension of 4096.
+It uses a hybrid Gated DeltaNet + Gated Attention architecture.
+The recommended analysis range is layers 16-26 (deep semantic zone).
+
+Architecture notes:
+- 32 transformer layers (indices 0-31).
+- hidden_states tuple has length 33: index 0 = initial embeddings,
+  indices 1-32 = outputs of each transformer layer.
+- Hybrid SSM+attention: past_key_values includes both KV cache (attention
+  layers) and recurrent state (DeltaNet layers). HuggingFace handles this
+  transparently via the unified past_key_values API.
 """
 
 from __future__ import annotations
@@ -26,14 +35,14 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 # Constants
 # ---------------------------------------------------------------------------
 
-DEFAULT_MODEL_NAME = "Qwen/Qwen3-0.6B"
-DEFAULT_LAYER_IDX = 14
+DEFAULT_MODEL_NAME = "Qwen/Qwen3.5-9B"
+DEFAULT_LAYER_IDX = 20
 DEFAULT_MAX_NEW_TOKENS = 100
-# Qwen3-0.6B has 28 transformer layers (indices 0-27).
-# hidden_states tuple has length 29: index 0 = initial embeddings,
-# indices 1-28 = outputs of each transformer layer.
-NUM_LAYERS = 28
-LAYER_RANGE = list(range(8, 23))  # 8-22 inclusive for the UI dropdown
+# Qwen3.5-9B has 32 transformer layers (indices 0-31).
+# hidden_states tuple has length 33: index 0 = initial embeddings,
+# indices 1-32 = outputs of each transformer layer.
+NUM_LAYERS = 32
+LAYER_RANGE = list(range(12, 29))  # 12-28 inclusive for the UI dropdown
 
 
 # ---------------------------------------------------------------------------
@@ -96,7 +105,7 @@ class StreamCheckpoint:
 # ---------------------------------------------------------------------------
 
 class ModelHandler:
-    """Wraps Qwen3-0.6B for embedding extraction and generation."""
+    """Wraps Qwen3.5-9B for embedding extraction and generation."""
 
     def __init__(
         self,

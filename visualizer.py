@@ -433,6 +433,339 @@ def plot_pca_3d(
 
 
 # ---------------------------------------------------------------------------
+# PCA-3D animated replay (from streaming checkpoints)
+# ---------------------------------------------------------------------------
+
+def plot_pca_3d_animated(
+    checkpoint_embeddings: list[np.ndarray],
+    checkpoint_tokens: list[list[str]] | None = None,
+    checkpoint_entropies: list[list[float]] | None = None,
+    entropy_threshold: float = 4.0,
+    title: str = "Token Trajectory Replay (PCA-3D)",
+) -> go.Figure:
+    """Animated Plotly 3-D scatter replaying generation checkpoint by checkpoint.
+
+    Strategy: PCA is fitted once on the *final* checkpoint's embeddings so
+    that all frames share the same coordinate axes.  Earlier frames project a
+    growing subset of tokens into that fixed space, showing the trajectory
+    building up token-by-token.
+
+    Parameters
+    ----------
+    checkpoint_embeddings:
+        List of ``(n_tokens_at_step, hidden_dim)`` arrays — one per
+        streaming checkpoint.  The final entry should have the most tokens.
+    checkpoint_tokens:
+        Optional list of token-string lists, parallel to
+        *checkpoint_embeddings*.
+    checkpoint_entropies:
+        Optional list of entropy lists, parallel to *checkpoint_embeddings*.
+    entropy_threshold:
+        Tokens above this entropy are outlined in red.
+
+    Returns
+    -------
+    A Plotly ``Figure`` with animation frames + play/pause controls.
+    """
+    from sklearn.decomposition import PCA
+
+    if not checkpoint_embeddings:
+        fig = go.Figure()
+        fig.update_layout(title=title, template="plotly_white")
+        return fig
+
+    # Fit PCA on the final (most complete) embedding set.
+    final_emb = checkpoint_embeddings[-1]
+    n_components = min(3, final_emb.shape[0], final_emb.shape[1])
+    if n_components < 2:
+        fig = go.Figure()
+        fig.update_layout(title="Not enough tokens for PCA animation", template="plotly_white")
+        return fig
+
+    pca = PCA(n_components=n_components)
+    pca.fit(final_emb)
+
+    # Project every checkpoint into the shared PCA space.
+    projected: list[np.ndarray] = [pca.transform(emb) for emb in checkpoint_embeddings]
+
+    # Compute global axis ranges so the camera stays fixed.
+    all_pts = np.vstack(projected)
+    pad = 0.15
+    x_range = [float(all_pts[:, 0].min() - pad), float(all_pts[:, 0].max() + pad)]
+    y_range = [float(all_pts[:, 1].min() - pad), float(all_pts[:, 1].max() + pad)]
+    z_range = [float(all_pts[:, 2].min() - pad), float(all_pts[:, 2].max() + pad)] if n_components >= 3 else None
+
+    def _make_trace(coords: np.ndarray, tokens: list[str] | None, entropies: list[float] | None) -> go.Scatter3d:
+        n = coords.shape[0]
+        color_vals = list(range(n))
+        line_colors = ["rgba(0,0,0,0)"] * n
+        line_widths = [0] * n
+        if entropies is not None:
+            for i, e in enumerate(entropies[:n]):
+                if e > entropy_threshold:
+                    line_colors[i] = "red"
+                    line_widths[i] = 3
+        hover = [tokens[i] if tokens and i < len(tokens) else str(i) for i in range(n)]
+        return go.Scatter3d(
+            x=coords[:, 0],
+            y=coords[:, 1],
+            z=coords[:, 2] if n_components >= 3 else [0.0] * n,
+            mode="markers+lines",
+            marker=dict(
+                size=5,
+                color=color_vals,
+                colorscale="Plasma",
+                cmin=0,
+                cmax=len(final_emb) - 1,
+                colorbar=dict(title="Token idx", thickness=12),
+                line=dict(color=line_colors, width=line_widths),
+            ),
+            line=dict(color="rgba(100,100,100,0.3)", width=1),
+            text=hover,
+            hovertemplate="Token: <b>%{text}</b><br>PC1: %{x:.3f}<br>PC2: %{y:.3f}<br>PC3: %{z:.3f}<extra></extra>",
+        )
+
+    # Build initial trace (first checkpoint).
+    init_tokens = checkpoint_tokens[0] if checkpoint_tokens else None
+    init_entropies = checkpoint_entropies[0] if checkpoint_entropies else None
+    initial_trace = _make_trace(projected[0], init_tokens, init_entropies)
+
+    # Build animation frames.
+    frames = []
+    for i, (coords, emb) in enumerate(zip(projected, checkpoint_embeddings)):
+        tok = checkpoint_tokens[i] if checkpoint_tokens else None
+        ent = checkpoint_entropies[i] if checkpoint_entropies else None
+        frames.append(go.Frame(
+            data=[_make_trace(coords, tok, ent)],
+            name=str(i),
+            layout=go.Layout(
+                title_text=f"{title} | frame {i+1}/{len(projected)} | tokens: {coords.shape[0]}",
+            ),
+        ))
+
+    # Slider steps.
+    slider_steps = [
+        dict(
+            args=[[str(i)], dict(frame=dict(duration=0, redraw=True), mode="immediate")],
+            label=str(coords.shape[0]),
+            method="animate",
+        )
+        for i, coords in enumerate(projected)
+    ]
+
+    scene_kwargs = dict(
+        xaxis=dict(title="PC1", range=x_range),
+        yaxis=dict(title="PC2", range=y_range),
+    )
+    if z_range:
+        scene_kwargs["zaxis"] = dict(title="PC3", range=z_range)
+
+    fig = go.Figure(
+        data=[initial_trace],
+        layout=go.Layout(
+            title=title,
+            template="plotly_white",
+            height=540,
+            margin=dict(l=0, r=0, t=60, b=0),
+            scene=scene_kwargs,
+            updatemenus=[dict(
+                type="buttons",
+                showactive=False,
+                y=1.08,
+                x=0.5,
+                xanchor="center",
+                buttons=[
+                    dict(
+                        label="▶ Play",
+                        method="animate",
+                        args=[None, dict(frame=dict(duration=200, redraw=True), fromcurrent=True)],
+                    ),
+                    dict(
+                        label="⏸ Pause",
+                        method="animate",
+                        args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")],
+                    ),
+                ],
+            )],
+            sliders=[dict(
+                steps=slider_steps,
+                active=0,
+                currentvalue=dict(prefix="Tokens: ", visible=True),
+                pad=dict(b=10, t=60),
+            )],
+        ),
+        frames=frames,
+    )
+    return fig
+
+
+def save_pca_animation_mp4(
+    checkpoint_embeddings: list[np.ndarray],
+    output_path: str,
+    checkpoint_tokens: list[list[str]] | None = None,
+    fps: int = 5,
+    title: str = "Token Trajectory (PCA-3D)",
+) -> None:
+    """Save a PCA-3D animation as an MP4 using matplotlib.
+
+    Requires ``ffmpeg`` to be installed and on PATH.  Install with::
+
+        # Ubuntu/Debian
+        sudo apt-get install ffmpeg
+        # macOS
+        brew install ffmpeg
+
+    Parameters
+    ----------
+    checkpoint_embeddings:
+        List of ``(n_tokens, hidden_dim)`` arrays — one per checkpoint.
+    output_path:
+        Destination ``.mp4`` file path.
+    checkpoint_tokens:
+        Optional token-label lists (for figure title).
+    fps:
+        Frames per second for the output video.
+    """
+    import matplotlib
+    matplotlib.use("Agg")  # headless rendering
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401 (registers 3D projection)
+    from sklearn.decomposition import PCA
+
+    if not checkpoint_embeddings:
+        raise ValueError("No checkpoint embeddings provided.")
+
+    final_emb = checkpoint_embeddings[-1]
+    n_components = min(3, final_emb.shape[0], final_emb.shape[1])
+    if n_components < 3:
+        raise ValueError("Need at least 3 PCA components; provide more tokens.")
+
+    pca = PCA(n_components=3)
+    pca.fit(final_emb)
+    projected = [pca.transform(emb) for emb in checkpoint_embeddings]
+
+    all_pts = np.vstack(projected)
+    x_lim = (float(all_pts[:, 0].min()) - 0.1, float(all_pts[:, 0].max()) + 0.1)
+    y_lim = (float(all_pts[:, 1].min()) - 0.1, float(all_pts[:, 1].max()) + 0.1)
+    z_lim = (float(all_pts[:, 2].min()) - 0.1, float(all_pts[:, 2].max()) + 0.1)
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    cmap = plt.cm.plasma
+    n_final = len(final_emb)
+
+    def _update(frame_idx: int) -> list:
+        ax.cla()
+        coords = projected[frame_idx]
+        n = coords.shape[0]
+        colors = [cmap(i / max(n_final - 1, 1)) for i in range(n)]
+
+        ax.scatter(coords[:, 0], coords[:, 1], coords[:, 2], c=colors, s=40, depthshade=True)
+        if n > 1:
+            ax.plot(coords[:, 0], coords[:, 1], coords[:, 2], "k-", alpha=0.25, linewidth=0.8)
+
+        ax.set_xlim(*x_lim)
+        ax.set_ylim(*y_lim)
+        ax.set_zlim(*z_lim)
+        ax.set_xlabel("PC1")
+        ax.set_ylabel("PC2")
+        ax.set_zlabel("PC3")
+
+        tok_count = n
+        label = checkpoint_tokens[frame_idx][-1] if (checkpoint_tokens and checkpoint_tokens[frame_idx]) else ""
+        ax.set_title(f"{title}\nFrame {frame_idx + 1}/{len(projected)}  |  tokens: {tok_count}  |  last: {label!r}")
+        return []
+
+    anim = animation.FuncAnimation(
+        fig, _update,
+        frames=len(projected),
+        interval=int(1000 / fps),
+        blit=False,
+    )
+
+    writer = animation.FFMpegWriter(fps=fps, bitrate=1800)
+    anim.save(output_path, writer=writer)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Qualitative interpretation helpers
+# ---------------------------------------------------------------------------
+
+def interpret_shift_metrics(shift) -> str:  # shift: TopologicalShiftMetrics
+    """Return a plain-English qualitative interpretation of a shift result.
+
+    Designed to give the experimenter instant readable context alongside the
+    raw Wasserstein and ΔH numbers.
+    """
+    lines: list[str] = []
+
+    # --- Overall severity --------------------------------------------------
+    sev = shift.shift_severity
+    w = shift.wasserstein_total
+    if sev == "stable":
+        lines.append(
+            f"**Topological stability** — the model's conceptual geometry barely "
+            f"changed (W={w:.3f}).  Its internal representations are highly robust "
+            "to this challenge; the semantic scaffold remained intact."
+        )
+    elif sev == "moderate":
+        lines.append(
+            f"**Moderate topological drift** detected (W={w:.3f}).  The model "
+            "reorganised some conceptual connections in response to the challenge, "
+            "but retained its overall structural coherence."
+        )
+    else:
+        lines.append(
+            f"**Large topological fragmentation** (W={w:.3f}).  The challenge "
+            "caused a substantial restructuring of the model's internal semantic "
+            "space — a strong signal of conceptual dissonance."
+        )
+
+    # --- H0 (connected components / clusters) ------------------------------
+    dh0 = shift.delta_num_h0
+    if dh0 > 2:
+        lines.append(
+            f"*Cluster fragmentation* (ΔH0={dh0:+d}): previously unified "
+            "concept clusters have splintered into smaller, isolated groups."
+        )
+    elif dh0 < -2:
+        lines.append(
+            f"*Cluster coalescence* (ΔH0={dh0:+d}): distinct conceptual "
+            "regions collapsed into fewer, larger clusters — the model may be "
+            "conflating previously separate ideas."
+        )
+
+    # --- H1 (loops / cycles) -----------------------------------------------
+    dh1 = shift.delta_num_h1
+    if dh1 > 1:
+        lines.append(
+            f"*New conceptual loops formed* (ΔH1={dh1:+d}): the model appears "
+            "to be oscillating between contradictory ideas, creating circular "
+            "reasoning structures in its representation space."
+        )
+    elif dh1 < -1:
+        lines.append(
+            f"*Loop dissolution* (ΔH1={dh1:+d}): established conceptual "
+            "cycles collapsed — potential loss of higher-order semantic "
+            "relationships under cognitive pressure."
+        )
+
+    # --- Stability scores --------------------------------------------------
+    low_stab = min(shift.stability_h0, shift.stability_h1)
+    if low_stab < 0.3:
+        lines.append(
+            f"*Persistence instability* (min stability={low_stab:.1%}): fewer "
+            "than 30 % of topological features persisted across turns — the "
+            "model's topological fingerprint changed dramatically."
+        )
+
+    return "  \n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

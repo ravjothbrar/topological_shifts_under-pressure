@@ -80,6 +80,9 @@ def __():
         plot_umap,
         plot_token_entropy,
         plot_pca_3d,
+        plot_pca_3d_animated,
+        save_pca_animation_mp4,
+        interpret_shift_metrics,
     )
     from scenarios import SCENARIOS, get_scenario_names, get_scenario_by_name
 
@@ -100,6 +103,9 @@ def __():
         plot_umap,
         plot_token_entropy,
         plot_pca_3d,
+        plot_pca_3d_animated,
+        save_pca_animation_mp4,
+        interpret_shift_metrics,
         SCENARIOS,
         get_scenario_names,
         get_scenario_by_name,
@@ -152,7 +158,7 @@ def __(mo):
 @app.cell
 def __(mo, DEFAULT_LAYER_IDX, DEFAULT_MAX_NEW_TOKENS, LAYER_RANGE):
     model_name_input = mo.ui.text(
-        value="Qwen/Qwen3-0.6B",
+        value="Qwen/Qwen3.5-9B",
         label="Model (HF hub ID)",
         full_width=True,
     )
@@ -480,6 +486,97 @@ def __(mo, stream_state, entropy_threshold_slider, plot_pca_3d, plot_token_entro
 
 
 # ---------------------------------------------------------------------------
+# Cell 13b: Animated PCA-3D replay + MP4 export (after generation finishes)
+# ---------------------------------------------------------------------------
+
+@app.cell
+def __(mo, stream_state, entropy_threshold_slider, plot_pca_3d_animated, save_pca_animation_mp4):
+    _cps = stream_state["checkpoints"]
+    _generating = stream_state["is_generating"]
+
+    # Only show replay when generation is done and we have checkpoints.
+    if not _cps or _generating:
+        animation_view = mo.md("")
+    else:
+        # Collect per-checkpoint embeddings (response only, growing).
+        _embs = [
+            cp.response_embeddings
+            for cp in _cps
+            if cp.response_embeddings.shape[0] >= 2
+        ]
+        _toks = [
+            cp.tokens_so_far
+            for cp in _cps
+            if cp.response_embeddings.shape[0] >= 2
+        ]
+        _ents = [
+            cp.token_entropies
+            for cp in _cps
+            if cp.response_embeddings.shape[0] >= 2
+        ]
+
+        if len(_embs) < 2:
+            animation_view = mo.md("*Need at least 2 checkpoints with ≥ 2 tokens for replay.*")
+        else:
+            _anim_fig = plot_pca_3d_animated(
+                _embs,
+                checkpoint_tokens=_toks,
+                checkpoint_entropies=_ents,
+                entropy_threshold=entropy_threshold_slider.value,
+                title="PCA-3D Generation Replay",
+            )
+
+            # --- HTML download (interactive animated figure) ---
+            import io, json as _json
+            _html_bytes = _anim_fig.to_html(full_html=True, include_plotlyjs="cdn").encode()
+            _html_dl = mo.download(
+                data=_html_bytes,
+                filename="pca3d_animation.html",
+                mimetype="text/html",
+                label="Download interactive animation (HTML)",
+            )
+
+            # --- MP4 download ---
+            import tempfile, os as _os, pathlib as _pl
+            _mp4_dl_widget = mo.md("")  # fallback if ffmpeg missing
+            try:
+                _tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+                _tmp.close()
+                save_pca_animation_mp4(
+                    _embs, _tmp.name,
+                    checkpoint_tokens=_toks,
+                    fps=4,
+                    title="Token Trajectory",
+                )
+                _mp4_bytes = _pl.Path(_tmp.name).read_bytes()
+                _os.unlink(_tmp.name)
+                _mp4_dl_widget = mo.download(
+                    data=_mp4_bytes,
+                    filename="pca3d_animation.mp4",
+                    mimetype="video/mp4",
+                    label="Download video (MP4, requires ffmpeg)",
+                )
+            except Exception as _e:
+                _mp4_dl_widget = mo.callout(
+                    mo.md(f"MP4 export unavailable: `{_e}`  \nInstall **ffmpeg** for video export."),
+                    kind="warn",
+                )
+
+            animation_view = mo.vstack([
+                mo.md("### 🎬 Generation Replay"),
+                mo.md(
+                    "The animated plot replays how the token trajectory evolved "
+                    "during generation.  Use **▶ Play** or drag the slider. "
+                    "Blue = early tokens, yellow/red = late tokens."
+                ),
+                mo.ui.plotly(_anim_fig),
+                mo.hstack([_html_dl, _mp4_dl_widget], gap=1),
+            ])
+
+    return (animation_view,)
+
+
+# ---------------------------------------------------------------------------
 # Cell 14: Analysis view (persistence, UMAP, shift metrics — after turns)
 # ---------------------------------------------------------------------------
 
@@ -492,6 +589,7 @@ def __(
     compute_umap, plot_umap, plot_token_entropy,
     compute_shift_metrics,
     detect_hallucination,
+    interpret_shift_metrics,
 ):
     if not turns:
         analysis_view = mo.md(
@@ -500,7 +598,7 @@ def __(
     else:
         _tab_contents = {}
 
-        # --- Persistence diagrams ------------------------------------------
+        # --- Persistence diagrams + qualitative interpretation -------------
         _last = turns[-1]
         _pers_fig = plot_persistence_diagram(
             _last["persistence"],
@@ -522,8 +620,13 @@ def __(
                 f"**H1:** {_shift.wasserstein_h1:.3f}  \n"
                 f"**ΔH0:** {_shift.delta_num_h0:+d}  ·  "
                 f"**ΔH1:** {_shift.delta_num_h1:+d}  \n"
+                f"**Stability H0:** {_shift.stability_h0:.1%}  ·  "
+                f"**Stability H1:** {_shift.stability_h1:.1%}  \n"
                 f"**Severity:** `{_shift.shift_severity}`"
             ))
+            # Qualitative interpretation
+            _qual = interpret_shift_metrics(_shift)
+            _pers_parts.append(mo.callout(mo.md(_qual), kind="info"))
 
         _tab_contents["Persistence"] = mo.vstack(_pers_parts)
 
@@ -570,26 +673,116 @@ def __(
         if _ent_parts:
             _tab_contents["Entropy"] = mo.vstack(_ent_parts)
 
-        # --- Shift timeline ------------------------------------------------
+        # --- Shift timeline + qualitative summaries ------------------------
         if len(turns) >= 2:
+            _all_shifts = []
             _metrics_rows = []
             for _i in range(1, len(turns)):
                 _sm = compute_shift_metrics(
                     turns[_i - 1]["persistence"], turns[_i]["persistence"]
                 )
+                _all_shifts.append((_i, turns[_i]["role"], _sm))
                 _metrics_rows.append(
                     f"| {_i} | {turns[_i]['role']} "
                     f"| {_sm.wasserstein_h0:.3f} "
                     f"| {_sm.wasserstein_h1:.3f} "
                     f"| {_sm.wasserstein_total:.3f} "
+                    f"| {_sm.delta_num_h0:+d} "
+                    f"| {_sm.delta_num_h1:+d} "
+                    f"| {_sm.stability_h0:.1%} "
+                    f"| {_sm.stability_h1:.1%} "
                     f"| `{_sm.shift_severity}` |"
                 )
             _metrics_md = (
-                "| Turn | Role | W-H0 | W-H1 | W-total | Severity |\n"
-                "|------|------|------|------|---------|----------|\n"
+                "| Turn | Role | W-H0 | W-H1 | W-total | ΔH0 | ΔH1 | Stab-H0 | Stab-H1 | Severity |\n"
+                "|------|------|------|------|---------|-----|-----|---------|---------|----------|\n"
                 + "\n".join(_metrics_rows)
             )
-            _tab_contents["Shift timeline"] = mo.md(_metrics_md)
+            _qual_parts = []
+            for _i, _role, _sm in _all_shifts:
+                _qual_parts.append(mo.md(f"**Turn {_i} ({_role}):**  \n{interpret_shift_metrics(_sm)}"))
+            _tab_contents["Shift timeline"] = mo.vstack([
+                mo.md(_metrics_md),
+                mo.md("---"),
+                mo.md("### Qualitative interpretations"),
+                *_qual_parts,
+            ])
+
+        # --- Metrics export (JSON download) --------------------------------
+        import json as _json
+        _export_data = []
+        for _i2, _t in enumerate(turns):
+            _t_entry: dict = {
+                "turn": _i2,
+                "role": _t["role"],
+                "prompt": _t["prompt"],
+                "response_text": _t["response_text"],
+                "mean_entropy": float(sum(_t["token_entropies"]) / max(len(_t["token_entropies"]), 1)),
+                "max_entropy": float(max(_t["token_entropies"], default=0.0)),
+                "num_response_tokens": len(_t["response_tokens"]),
+                "h0_features": int(_t["persistence"].num_h0),
+                "h1_features": int(_t["persistence"].num_h1),
+                "mean_persistence_h0": float(_t["persistence"].mean_persistence_h0),
+                "mean_persistence_h1": float(_t["persistence"].mean_persistence_h1),
+                "max_persistence_h0": float(_t["persistence"].max_persistence_h0),
+                "max_persistence_h1": float(_t["persistence"].max_persistence_h1),
+            }
+            if _i2 >= 1:
+                _sm_ex = compute_shift_metrics(
+                    turns[_i2 - 1]["persistence"], _t["persistence"]
+                )
+                _t_entry.update({
+                    "wasserstein_h0": float(_sm_ex.wasserstein_h0),
+                    "wasserstein_h1": float(_sm_ex.wasserstein_h1),
+                    "wasserstein_total": float(_sm_ex.wasserstein_total),
+                    "delta_h0": int(_sm_ex.delta_num_h0),
+                    "delta_h1": int(_sm_ex.delta_num_h1),
+                    "stability_h0": float(_sm_ex.stability_h0),
+                    "stability_h1": float(_sm_ex.stability_h1),
+                    "shift_severity": _sm_ex.shift_severity,
+                    "qualitative_interpretation": interpret_shift_metrics(_sm_ex),
+                })
+            _export_data.append(_t_entry)
+
+        _json_bytes = _json.dumps(_export_data, indent=2).encode()
+        _json_dl = mo.download(
+            data=_json_bytes,
+            filename="topological_shift_metrics.json",
+            mimetype="application/json",
+            label="Download all metrics (JSON)",
+        )
+
+        # CSV export
+        import io as _io
+        _csv_buf = _io.StringIO()
+        _csv_fields = [
+            "turn", "role", "mean_entropy", "max_entropy", "num_response_tokens",
+            "h0_features", "h1_features", "mean_persistence_h0", "mean_persistence_h1",
+            "wasserstein_h0", "wasserstein_h1", "wasserstein_total",
+            "delta_h0", "delta_h1", "stability_h0", "stability_h1", "shift_severity",
+        ]
+        _csv_buf.write(",".join(_csv_fields) + "\n")
+        for _row in _export_data:
+            _csv_buf.write(",".join(str(_row.get(f, "")) for f in _csv_fields) + "\n")
+        _csv_bytes = _csv_buf.getvalue().encode()
+        _csv_dl = mo.download(
+            data=_csv_bytes,
+            filename="topological_shift_metrics.csv",
+            mimetype="text/csv",
+            label="Download all metrics (CSV)",
+        )
+
+        _tab_contents["Export metrics"] = mo.vstack([
+            mo.md("Download the full quantitative metrics table for all turns."),
+            mo.hstack([_json_dl, _csv_dl], gap=1),
+            mo.md("---"),
+            mo.md("**Preview (latest turn):**"),
+            mo.md(
+                "```json\n" +
+                _json.dumps(_export_data[-1], indent=2) +
+                "\n```"
+            ),
+        ])
 
         analysis_view = mo.tabs(_tab_contents)
 
@@ -667,6 +860,7 @@ def __(
     controls_panel,
     baseline_input, challenge_input, run_baseline_btn, run_challenge_btn,
     live_view,
+    animation_view,
     analysis_view,
     history_view,
     turns,
@@ -691,6 +885,7 @@ def __(
         mo.md("---"),
         mo.md("### 📡 Live view"),
         live_view,
+        animation_view,
         mo.md("---"),
         mo.md("### 📊 Analysis"),
         analysis_view,
