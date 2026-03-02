@@ -162,6 +162,15 @@ def __(mo, DEFAULT_LAYER_IDX, DEFAULT_MAX_NEW_TOKENS, LAYER_RANGE):
         label="Model (HF hub ID)",
         full_width=True,
     )
+    quantization_dropdown = mo.ui.dropdown(
+        options={
+            "int4 — NF4 4-bit  (~5.5 GB VRAM, fits 8/12 GB GPU)": "int4",
+            "int8 — 8-bit      (~9.5 GB VRAM, fits 12 GB GPU)": "int8",
+            "None — full bf16  (~18 GB VRAM, 24 GB+ GPU only)": None,
+        },
+        value="int4 — NF4 4-bit  (~5.5 GB VRAM, fits 8/12 GB GPU)",
+        label="Quantisation",
+    )
     load_btn = mo.ui.run_button(label="⚡ Load / reload model")
 
     layer_slider = mo.ui.slider(
@@ -187,7 +196,7 @@ def __(mo, DEFAULT_LAYER_IDX, DEFAULT_MAX_NEW_TOKENS, LAYER_RANGE):
     )
 
     return (
-        model_name_input, load_btn,
+        model_name_input, quantization_dropdown, load_btn,
         layer_slider, temperature_slider, max_tokens_slider,
         checkpoint_slider, noise_threshold_slider, entropy_threshold_slider,
     )
@@ -214,14 +223,17 @@ def __(mo, get_scenario_names):
 @app.cell
 async def __(
     mo, asyncio,
-    load_btn, model_name_input,
+    load_btn, model_name_input, quantization_dropdown,
     ModelHandler,
     set_handler_state, set_model_status,
 ):
     mo.stop(not load_btn.value)
     set_model_status("loading")
     try:
-        handler = ModelHandler(model_name=model_name_input.value)
+        handler = ModelHandler(
+            model_name=model_name_input.value,
+            quantization=quantization_dropdown.value,
+        )
         # Run the blocking load() in a thread so the event loop stays alive.
         await asyncio.to_thread(handler.load)
         set_handler_state(handler)
@@ -823,7 +835,7 @@ def __(mo, turns):
 @app.cell
 def __(
     mo,
-    model_name_input, load_btn,
+    model_name_input, quantization_dropdown, load_btn,
     layer_slider, temperature_slider, max_tokens_slider,
     checkpoint_slider, noise_threshold_slider, entropy_threshold_slider,
     scenario_dropdown,
@@ -831,6 +843,7 @@ def __(
     controls_panel = mo.vstack([
         mo.md("## ⚙️ Model"),
         model_name_input,
+        quantization_dropdown,
         load_btn,
         mo.md("---"),
         mo.md("## 🎛 Generation"),

@@ -112,10 +112,13 @@ class ModelHandler:
         model_name: str = DEFAULT_MODEL_NAME,
         layer_idx: int = DEFAULT_LAYER_IDX,
         device: str | None = None,
+        quantization: str | None = None,
     ):
         self.model_name = model_name
         self.layer_idx = layer_idx
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        # "int4" → bitsandbytes NF4  |  "int8" → bitsandbytes int8  |  None → full precision
+        self.quantization = quantization
 
         self.tokenizer: AutoTokenizer | None = None
         self.model: AutoModelForCausalLM | None = None
@@ -126,7 +129,21 @@ class ModelHandler:
     # ------------------------------------------------------------------
 
     def load(self) -> None:
-        """Download (if needed) and load the model + tokenizer."""
+        """Download (if needed) and load the model + tokenizer.
+
+        Quantisation notes
+        ------------------
+        ``int4`` (NF4 via bitsandbytes) requires ~5.5 GB VRAM for the 9B
+        model — fits comfortably on an 8 GB or 12 GB laptop GPU.
+
+        ``int8`` requires ~9.5 GB VRAM — fits on 12 GB but very tight on 8 GB.
+
+        ``None`` (full bf16) requires ~18 GB VRAM — GPU only for 24 GB+ cards.
+
+        ``device_map="auto"`` lets *accelerate* split layers across GPU + CPU
+        when the model is too large for VRAM alone, so the experiment always
+        runs even if VRAM is insufficient, just more slowly.
+        """
         if self._loaded:
             return
 
@@ -135,14 +152,39 @@ class ModelHandler:
             trust_remote_code=True,
         )
 
+        bnb_config = None
+        if self.quantization == "int4":
+            from transformers import BitsAndBytesConfig
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+        elif self.quantization == "int8":
+            from transformers import BitsAndBytesConfig
+            bnb_config = BitsAndBytesConfig(load_in_8bit=True)
+
         self.model = AutoModelForCausalLM.from_pretrained(
             self.model_name,
-            torch_dtype="auto",
-            device_map=self.device,
+            torch_dtype=torch.bfloat16 if bnb_config is not None else "auto",
+            device_map="auto",        # accelerate handles GPU/CPU layer split
+            quantization_config=bnb_config,
             trust_remote_code=True,
         )
         self.model.eval()
         self._loaded = True
+
+    @property
+    def input_device(self) -> torch.device:
+        """Device to move tokeniser outputs to before each forward pass.
+
+        With ``device_map="auto"`` the model spans multiple devices; inputs
+        must go to the *first* layer's device (always GPU if one is present).
+        """
+        if self.model is not None:
+            return next(self.model.parameters()).device
+        return torch.device(self.device)
 
     @property
     def is_loaded(self) -> bool:
@@ -192,7 +234,7 @@ class ModelHandler:
         assert self.model is not None and self.tokenizer is not None
         layer_idx = layer_idx if layer_idx is not None else self.layer_idx
 
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.input_device)
 
         with torch.no_grad():
             outputs = self.model(**inputs, output_hidden_states=True)
@@ -230,7 +272,7 @@ class ModelHandler:
 
         # 1. Format ---------------------------------------------------
         text = self.format_prompt(messages)
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.input_device)
         prompt_len = inputs["input_ids"].shape[1]
 
         # 2. Generate -------------------------------------------------
@@ -325,7 +367,7 @@ class ModelHandler:
         eos_id = self.tokenizer.eos_token_id
 
         text = self.format_prompt(messages)
-        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.input_device)
         input_ids = inputs["input_ids"]          # (1, prompt_len)
         hidden_dim = self.model.config.hidden_size
 
