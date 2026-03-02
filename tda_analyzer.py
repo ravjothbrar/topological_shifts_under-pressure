@@ -33,6 +33,7 @@ import numpy as np
 from ripser import ripser
 from persim import wasserstein, PersistenceImager
 from scipy.spatial.distance import pdist, squareform
+from sklearn.decomposition import PCA
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +186,59 @@ def compute_shift_metrics(
         stability_h1=stab_h1,
         shift_severity=severity,
     )
+
+
+def compute_persistence_pca(
+    embeddings: np.ndarray,
+    n_pca_components: int = 3,
+    noise_threshold: float = 0.0,
+    subsample: int | None = 300,
+) -> tuple[PersistenceResult, np.ndarray]:
+    """Fast persistence computation via PCA pre-reduction.
+
+    Reduces high-dimensional embeddings to *n_pca_components* dimensions with
+    PCA (a linear projection that is instant even for 1024-D inputs), then
+    runs Vietoris-Rips on the low-dimensional point cloud.  H0 and H1
+    computation on ~100 points in 3-D takes < 50 ms on CPU, making this
+    suitable for use inside a streaming generation loop.
+
+    Parameters
+    ----------
+    embeddings:
+        Array of shape ``(n_points, n_features)``.
+    n_pca_components:
+        Target dimensionality for PCA (default 3 for 3-D scatter visualisation).
+    noise_threshold:
+        Minimum persistence for a feature to be kept.
+    subsample:
+        Sub-sample if more than this many points (see :func:`compute_persistence`).
+
+    Returns
+    -------
+    (PersistenceResult, pca_coords)
+        ``pca_coords`` is ``(n_points, n_pca_components)`` and can be used
+        directly for scatter-plot visualisation.
+    """
+    pts = np.asarray(embeddings, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+
+    if pts.shape[0] < 2:
+        empty = np.empty((0, 2))
+        pca_coords = pts[:, :n_pca_components] if pts.shape[1] >= n_pca_components else pts
+        return PersistenceResult(diagrams=[empty, empty]), pca_coords.astype(np.float32)
+
+    n_components = min(n_pca_components, pts.shape[0], pts.shape[1])
+    pca = PCA(n_components=n_components)
+    pca_coords = pca.fit_transform(pts).astype(np.float32)
+
+    result = compute_persistence(
+        pca_coords,
+        max_dim=1,
+        noise_threshold=noise_threshold,
+        subsample=subsample,
+    )
+    return result, pca_coords
 
 
 # ---------------------------------------------------------------------------

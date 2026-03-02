@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from typing import AsyncGenerator
 
 import numpy as np
 import torch
@@ -66,6 +67,28 @@ class ConversationTurn:
     prompt: str
     result: GenerationResult | None = None
     messages: list[dict] = field(default_factory=list)
+
+
+@dataclass
+class StreamCheckpoint:
+    """Snapshot emitted every N tokens during streaming generation.
+
+    ``prompt_embeddings`` is constant across all checkpoints for a given turn.
+    ``response_embeddings`` grows by one row per processed token.
+
+    The hidden state for token *k* comes from the forward pass where *k* is
+    the *input* token — i.e. we know the embedding for each generated token
+    only after the model has processed it and produced logits for *k+1*.
+    This introduces a one-token lag: the final EOS token has no embedding.
+    """
+
+    token_idx: int                     # 0-based index of last embedded token
+    tokens_so_far: list[str]          # raw BPE tokens (for entropy chart labels)
+    response_text: str                # human-readable text decoded so far
+    prompt_embeddings: np.ndarray     # (prompt_len, hidden_dim) — constant
+    response_embeddings: np.ndarray   # (n_embedded, hidden_dim) — grows each cp
+    token_entropies: list[float]      # Shannon entropy (nats) per response token
+    is_eos: bool                      # True on the final checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +281,128 @@ class ModelHandler:
             max_entropy=max_ent,
             prompt_len=prompt_len,
         )
+
+
+    async def stream_tokens_async(
+        self,
+        messages: list[dict],
+        layer_idx: int | None = None,
+        max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
+        temperature: float = 0.7,
+        checkpoint_every: int = 5,
+    ) -> AsyncGenerator[StreamCheckpoint, None]:
+        """Async generator: yield :class:`StreamCheckpoint` every *checkpoint_every* tokens.
+
+        Uses a manual KV-cache autoregressive loop so we capture per-token
+        hidden states without a redundant forward pass.  The cost over plain
+        ``model.generate`` is negligible on GPU.
+
+        Algorithm
+        ---------
+        1. Full forward pass on the prompt → prompt embeddings + first-token
+           logits + KV cache.
+        2. For each response token:
+           a. Sample token *t* from current logits.
+           b. Forward pass with *t* as sole input (KV cache handles context) →
+              hidden state for *t* + logits for *t+1*.
+           c. Append hidden state and entropy.
+           d. Yield a :class:`StreamCheckpoint` every *checkpoint_every* steps.
+        3. Always yield a final checkpoint with ``is_eos=True``.
+        """
+        import asyncio
+
+        assert self.model is not None and self.tokenizer is not None
+        layer_idx = layer_idx if layer_idx is not None else self.layer_idx
+        eos_id = self.tokenizer.eos_token_id
+
+        text = self.format_prompt(messages)
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.device)
+        input_ids = inputs["input_ids"]          # (1, prompt_len)
+        hidden_dim = self.model.config.hidden_size
+
+        # --- Prompt forward pass -------------------------------------------
+        with torch.no_grad():
+            init_out = self.model(
+                input_ids=input_ids,
+                output_hidden_states=True,
+                use_cache=True,
+            )
+        prompt_embeddings = (
+            init_out.hidden_states[layer_idx + 1].squeeze(0).cpu().float().numpy()
+        )
+        past_key_values = init_out.past_key_values
+        next_logits = init_out.logits[:, -1, :]   # (1, vocab_size)
+
+        generated_ids: list[int] = []
+        response_hiddens: list[np.ndarray] = []
+        token_entropies: list[float] = []
+        is_eos = False
+
+        def _make_checkpoint(final: bool) -> StreamCheckpoint:
+            resp_ids = generated_ids[:-1] if (final and is_eos) else generated_ids
+            resp_text = self.tokenizer.decode(resp_ids, skip_special_tokens=True)
+            bpe_tokens = self.tokenizer.convert_ids_to_tokens(resp_ids) or []
+            embs = (
+                np.stack(response_hiddens)
+                if response_hiddens
+                else np.empty((0, hidden_dim), dtype=np.float32)
+            )
+            return StreamCheckpoint(
+                token_idx=len(generated_ids) - 1,
+                tokens_so_far=bpe_tokens,
+                response_text=resp_text,
+                prompt_embeddings=prompt_embeddings,
+                response_embeddings=embs,
+                token_entropies=list(token_entropies),
+                is_eos=final,
+            )
+
+        steps_since_cp = 0
+
+        for _step in range(max_new_tokens):
+            # Yield to the event loop so marimo can process state updates.
+            await asyncio.sleep(0)
+
+            # Sample next token from current logits.
+            if temperature > 0:
+                probs = torch.softmax(next_logits / temperature, dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1)  # (1, 1)
+            else:
+                next_token = next_logits.argmax(dim=-1, keepdim=True)
+
+            next_id = next_token.item()
+
+            # Entropy for this prediction step.
+            ep = torch.softmax(next_logits[0], dim=-1).clamp(min=1e-12)
+            entropy = float(-(ep * ep.log()).sum())
+
+            generated_ids.append(next_id)
+            token_entropies.append(entropy)
+            is_eos = next_id == eos_id
+
+            if is_eos:
+                break
+
+            # Forward pass: get hidden state for the token we just sampled.
+            with torch.no_grad():
+                step_out = self.model(
+                    input_ids=next_token,
+                    past_key_values=past_key_values,
+                    output_hidden_states=True,
+                    use_cache=True,
+                )
+            h = step_out.hidden_states[layer_idx + 1][0, 0].cpu().float().numpy()
+            response_hiddens.append(h)
+            past_key_values = step_out.past_key_values
+            next_logits = step_out.logits[:, -1, :]
+
+            steps_since_cp += 1
+            if steps_since_cp >= checkpoint_every:
+                steps_since_cp = 0
+                yield _make_checkpoint(final=False)
+
+        # Always emit a terminal checkpoint.
+        yield _make_checkpoint(final=True)
 
 
 # ---------------------------------------------------------------------------

@@ -6,9 +6,10 @@ Produces interactive Plotly figures for:
 - UMAP embedding projections (2-D and optional 3-D)
 - Metric summary cards
 - Per-token entropy bar charts
+- PCA-3D live token trajectory (for real-time streaming view)
 
-All public functions return ``plotly.graph_objects.Figure`` instances that
-can be embedded directly in a Streamlit layout via ``st.plotly_chart``.
+All public functions return ``plotly.graph_objects.Figure`` instances
+suitable for ``mo.ui.plotly`` in marimo or ``st.plotly_chart`` in Streamlit.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from umap import UMAP
 
-from tda_analyzer import PersistenceResult, TopologicalShiftMetrics
+from tda_analyzer import PersistenceResult, TopologicalShiftMetrics, compute_persistence_pca
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +324,110 @@ def plot_token_entropy(
         yaxis_title="Entropy (nats)",
         template="plotly_white",
         height=300,
+    )
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# PCA-3D live token trajectory (streaming view)
+# ---------------------------------------------------------------------------
+
+def plot_pca_3d(
+    embeddings: np.ndarray,
+    tokens: list[str] | None = None,
+    entropy_values: list[float] | None = None,
+    entropy_threshold: float = 4.0,
+    title: str = "Token Trajectory (PCA-3D)",
+) -> go.Figure:
+    """Interactive 3-D scatter of token embeddings projected via PCA.
+
+    Points are coloured by token index (temporal ordering) so you can see
+    the trajectory the model traces through its internal space while
+    generating.  High-entropy tokens are outlined in red.
+
+    PCA is performed internally so the function is self-contained and fast
+    (< 5 ms for 1024-D → 3-D on 100 points on CPU).
+
+    Parameters
+    ----------
+    embeddings:
+        Array of shape ``(n_tokens, hidden_dim)``.
+    tokens:
+        Optional list of BPE token strings for hover text.
+    entropy_values:
+        Optional per-token Shannon entropy values.  Tokens above
+        *entropy_threshold* receive a red outline.
+    entropy_threshold:
+        Entropy value above which a token is considered high-uncertainty.
+    """
+    fig = go.Figure()
+
+    if embeddings.shape[0] < 2:
+        fig.update_layout(title=title, template="plotly_white")
+        return fig
+
+    _, pca_coords = compute_persistence_pca(embeddings, n_pca_components=3)
+    n = pca_coords.shape[0]
+
+    # Temporal colour gradient: blue (early) → red (late)
+    color_vals = list(range(n))
+
+    marker_line_colors = ["rgba(0,0,0,0)"] * n
+    marker_line_widths = [0] * n
+    if entropy_values is not None:
+        for i, e in enumerate(entropy_values[:n]):
+            if e > entropy_threshold:
+                marker_line_colors[i] = "red"
+                marker_line_widths[i] = 2
+
+    hover_text = [tokens[i] if tokens and i < len(tokens) else str(i) for i in range(n)]
+
+    # 3-D when we have the z dimension, else fall back to 2-D.
+    if pca_coords.shape[1] >= 3:
+        fig.add_trace(go.Scatter3d(
+            x=pca_coords[:, 0],
+            y=pca_coords[:, 1],
+            z=pca_coords[:, 2],
+            mode="markers+lines",
+            marker=dict(
+                size=5,
+                color=color_vals,
+                colorscale="Plasma",
+                colorbar=dict(title="Token idx", thickness=12),
+                line=dict(color=marker_line_colors, width=marker_line_widths),
+            ),
+            line=dict(color="rgba(100,100,100,0.3)", width=1),
+            text=hover_text,
+            hovertemplate="Token: <b>%{text}</b><br>x: %{x:.3f}<br>y: %{y:.3f}<br>z: %{z:.3f}<extra></extra>",
+        ))
+        fig.update_layout(
+            scene=dict(
+                xaxis_title="PC1",
+                yaxis_title="PC2",
+                zaxis_title="PC3",
+            ),
+        )
+    else:
+        fig.add_trace(go.Scatter(
+            x=pca_coords[:, 0],
+            y=pca_coords[:, 1] if pca_coords.shape[1] > 1 else np.zeros(n),
+            mode="markers+lines",
+            marker=dict(
+                size=7,
+                color=color_vals,
+                colorscale="Plasma",
+                colorbar=dict(title="Token idx", thickness=12),
+            ),
+            text=hover_text,
+            hovertemplate="Token: <b>%{text}</b><br>x: %{x:.3f}<br>y: %{y:.3f}<extra></extra>",
+        ))
+        fig.update_layout(xaxis_title="PC1", yaxis_title="PC2")
+
+    fig.update_layout(
+        title=title,
+        template="plotly_white",
+        height=480,
+        margin=dict(l=0, r=0, t=40, b=0),
     )
     return fig
 
