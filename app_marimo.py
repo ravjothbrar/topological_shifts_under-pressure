@@ -66,6 +66,7 @@ def __():
         DEFAULT_MAX_NEW_TOKENS,
         LAYER_RANGE,
         detect_hallucination,
+        compute_embedding_consistency,
     )
     from tda_analyzer import (
         compute_persistence,
@@ -602,6 +603,7 @@ def __(
     compute_shift_metrics,
     detect_hallucination,
     interpret_shift_metrics,
+    compute_embedding_consistency,
 ):
     if not turns:
         analysis_view = mo.md(
@@ -626,6 +628,10 @@ def __(
                 turns[-2]["persistence"], turns[-1]["persistence"]
             )
             _pers_parts.append(mo.ui.plotly(_cmp_fig))
+            _consistency = compute_embedding_consistency(
+                np.vstack([turns[-2]["prompt_embeddings"], turns[-2]["response_embeddings"]]),
+                np.vstack([turns[-1]["prompt_embeddings"], turns[-1]["response_embeddings"]]),
+            )
             _pers_parts.append(mo.md(
                 f"**Wasserstein total:** {_shift.wasserstein_total:.3f}  \n"
                 f"**H0:** {_shift.wasserstein_h0:.3f}  ·  "
@@ -634,7 +640,8 @@ def __(
                 f"**ΔH1:** {_shift.delta_num_h1:+d}  \n"
                 f"**Stability H0:** {_shift.stability_h0:.1%}  ·  "
                 f"**Stability H1:** {_shift.stability_h1:.1%}  \n"
-                f"**Severity:** `{_shift.shift_severity}`"
+                f"**Severity:** `{_shift.shift_severity}`  \n"
+                f"**Embedding consistency:** {_consistency:.3f}"
             ))
             # Qualitative interpretation
             _qual = interpret_shift_metrics(_shift)
@@ -693,6 +700,10 @@ def __(
                 _sm = compute_shift_metrics(
                     turns[_i - 1]["persistence"], turns[_i]["persistence"]
                 )
+                _ec = compute_embedding_consistency(
+                    np.vstack([turns[_i - 1]["prompt_embeddings"], turns[_i - 1]["response_embeddings"]]),
+                    np.vstack([turns[_i]["prompt_embeddings"], turns[_i]["response_embeddings"]]),
+                )
                 _all_shifts.append((_i, turns[_i]["role"], _sm))
                 _metrics_rows.append(
                     f"| {_i} | {turns[_i]['role']} "
@@ -703,11 +714,12 @@ def __(
                     f"| {_sm.delta_num_h1:+d} "
                     f"| {_sm.stability_h0:.1%} "
                     f"| {_sm.stability_h1:.1%} "
-                    f"| `{_sm.shift_severity}` |"
+                    f"| `{_sm.shift_severity}` "
+                    f"| {_ec:.3f} |"
                 )
             _metrics_md = (
-                "| Turn | Role | W-H0 | W-H1 | W-total | ΔH0 | ΔH1 | Stab-H0 | Stab-H1 | Severity |\n"
-                "|------|------|------|------|---------|-----|-----|---------|---------|----------|\n"
+                "| Turn | Role | W-H0 | W-H1 | W-total | ΔH0 | ΔH1 | Stab-H0 | Stab-H1 | Severity | Emb. Consistency |\n"
+                "|------|------|------|------|---------|-----|-----|---------|---------|----------|------------------|\n"
                 + "\n".join(_metrics_rows)
             )
             _qual_parts = []
