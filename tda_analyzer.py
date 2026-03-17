@@ -74,6 +74,39 @@ class TopologicalShiftMetrics:
     shift_severity: str = "stable"  # "stable" | "moderate" | "large"
 
 
+@dataclass
+class DimensionalityProfile:
+    """PCA-based dimensionality summary for a single embedding point cloud.
+
+    Runs cheaply alongside TDA and gives a continuous signal that Wasserstein
+    distance alone cannot provide: whether the representation is collapsing
+    into a few dominant directions or fragmenting across many.
+    """
+
+    intrinsic_k: int               # components needed to explain >= 85% variance
+    elbow_slope: float             # mean drop in explained-variance per component
+    pc1_variance: float            # fraction of variance captured by PC1 alone
+    explained_variance_ratio: np.ndarray = field(
+        default_factory=lambda: np.array([])
+    )
+
+
+@dataclass
+class DimensionalityShift:
+    """Comparison between two DimensionalityProfiles (baseline → challenge).
+
+    Positive delta_intrinsic_k means the model recruited more dimensions —
+    a fragmentation signature associated with gaslighting / conflict.
+    Negative delta_intrinsic_k with rising pc1_variance_shift is a collapse
+    signature associated with free confabulation / hallucination.
+    """
+
+    delta_intrinsic_k: int         # +ve = fragmentation, -ve = collapse
+    elbow_shift: float             # change in curve sharpness
+    pc1_variance_shift: float      # change in PC1 dominance (−ve = more spread)
+    interpretation: str            # "fragmentation" | "collapse" | "stable"
+
+
 # ---------------------------------------------------------------------------
 # Core TDA functions
 # ---------------------------------------------------------------------------
@@ -320,3 +353,96 @@ def _stability(
         return 1.0 if wasserstein_dist < 1e-12 else 0.0
     ratio = wasserstein_dist / mean_persistence
     return float(max(0.0, 1.0 - ratio))
+
+
+# ---------------------------------------------------------------------------
+# Dimensionality profile
+# ---------------------------------------------------------------------------
+
+def compute_dimensionality_profile(
+    embeddings: np.ndarray,
+    variance_threshold: float = 0.85,
+) -> DimensionalityProfile:
+    """Compute a PCA-based dimensionality profile for an embedding point cloud.
+
+    Runs a full PCA on the point cloud and extracts three scalar summaries:
+    - ``intrinsic_k``: smallest number of components that together explain
+      at least *variance_threshold* of the total variance.
+    - ``elbow_slope``: mean magnitude of the drop between successive
+      explained-variance fractions.  A large value means a sharp elbow
+      (representation dominated by a few components); a small value means
+      a flat curve (variance spread across many components).
+    - ``pc1_variance``: fraction of variance in the first component alone —
+      a direct measure of how "collapsed" the representation is.
+
+    Parameters
+    ----------
+    embeddings:
+        Array of shape ``(n_points, n_features)``.
+    variance_threshold:
+        Cumulative explained-variance target for ``intrinsic_k`` (default 0.85).
+    """
+    pts = np.asarray(embeddings, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+
+    if pts.shape[0] < 2:
+        return DimensionalityProfile(
+            intrinsic_k=1,
+            elbow_slope=0.0,
+            pc1_variance=1.0,
+            explained_variance_ratio=np.array([1.0]),
+        )
+
+    n_components = min(pts.shape[0], pts.shape[1])
+    pca = PCA(n_components=n_components)
+    pca.fit(pts)
+    evr = pca.explained_variance_ratio_
+
+    cumvar = np.cumsum(evr)
+    k_idx = np.where(cumvar >= variance_threshold)[0]
+    intrinsic_k = int(k_idx[0]) + 1 if len(k_idx) > 0 else n_components
+
+    slopes = np.diff(evr)
+    elbow_slope = float(-slopes.mean()) if len(slopes) > 0 else 0.0
+
+    return DimensionalityProfile(
+        intrinsic_k=intrinsic_k,
+        elbow_slope=elbow_slope,
+        pc1_variance=float(evr[0]),
+        explained_variance_ratio=evr,
+    )
+
+
+def compare_dimensionality_profiles(
+    baseline: DimensionalityProfile,
+    challenged: DimensionalityProfile,
+) -> DimensionalityShift:
+    """Compare two DimensionalityProfiles and classify the geometric shift.
+
+    Classification rules (applied in order):
+    - **fragmentation**: intrinsic_k rose by ≥ 2 *and* PC1 variance fell by
+      > 5 pp — the model is recruiting extra dimensions under representational
+      conflict (gaslighting signal).
+    - **collapse**: intrinsic_k fell by ≥ 2 *and* PC1 variance rose by > 5 pp
+      — the model is settling into a simpler, self-consistent structure
+      (hallucination / free-confabulation signal).
+    - **stable**: neither threshold met.
+    """
+    dk = challenged.intrinsic_k - baseline.intrinsic_k
+    d_slope = challenged.elbow_slope - baseline.elbow_slope
+    d_pc1 = challenged.pc1_variance - baseline.pc1_variance
+
+    if dk >= 2 and d_pc1 < -0.05:
+        interp = "fragmentation"
+    elif dk <= -2 and d_pc1 > 0.05:
+        interp = "collapse"
+    else:
+        interp = "stable"
+
+    return DimensionalityShift(
+        delta_intrinsic_k=dk,
+        elbow_shift=float(d_slope),
+        pc1_variance_shift=float(d_pc1),
+        interpretation=interp,
+    )

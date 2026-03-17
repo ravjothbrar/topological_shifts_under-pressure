@@ -244,6 +244,38 @@ class ModelHandler:
         hidden_state = outputs.hidden_states[layer_idx + 1]
         return hidden_state.squeeze(0).cpu().float().numpy()
 
+    def extract_embeddings_multi_layer(
+        self,
+        text: str,
+        layer_indices: list[int],
+    ) -> dict[int, np.ndarray]:
+        """Single forward pass returning hidden states from multiple layers.
+
+        Compared with calling :meth:`extract_embeddings` repeatedly, this
+        incurs only *one* forward pass regardless of how many layers are
+        requested, making it efficient for layer-calibration sweeps.
+
+        Parameters
+        ----------
+        text:
+            Already-formatted text (e.g. output of :meth:`format_prompt`).
+        layer_indices:
+            Transformer layer indices to extract (0-based).
+
+        Returns
+        -------
+        Dict mapping each requested layer index to a numpy array of shape
+        ``(seq_len, hidden_dim)``.
+        """
+        assert self.model is not None and self.tokenizer is not None
+        inputs = self.tokenizer(text, return_tensors="pt").to(self.input_device)
+        with torch.no_grad():
+            outputs = self.model(**inputs, output_hidden_states=True)
+        return {
+            idx: outputs.hidden_states[idx + 1].squeeze(0).cpu().float().numpy()
+            for idx in layer_indices
+        }
+
     # ------------------------------------------------------------------
     # Generation with embedding + entropy capture
     # ------------------------------------------------------------------

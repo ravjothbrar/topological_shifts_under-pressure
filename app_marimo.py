@@ -73,6 +73,9 @@ def __():
         compute_persistence_pca,
         compute_shift_metrics,
         PersistenceResult,
+        compute_dimensionality_profile,
+        compare_dimensionality_profiles,
+        DimensionalityShift,
     )
     from visualizer import (
         plot_persistence_diagram,
@@ -94,10 +97,14 @@ def __():
         DEFAULT_MAX_NEW_TOKENS,
         LAYER_RANGE,
         detect_hallucination,
+        compute_embedding_consistency,
         compute_persistence,
         compute_persistence_pca,
         compute_shift_metrics,
         PersistenceResult,
+        compute_dimensionality_profile,
+        compare_dimensionality_profiles,
+        DimensionalityShift,
         plot_persistence_diagram,
         plot_persistence_comparison,
         compute_umap,
@@ -143,12 +150,16 @@ def __(mo):
     # the async generator cell.  None means idle.
     pending_gen, set_pending_gen = mo.state(None)
 
+    # Layer-calibration results: dict[layer_idx → DimensionalityShift] or None.
+    calib_results, set_calib_results = mo.state(None)
+
     return (
         handler_state, set_handler_state,
         model_status, set_model_status,
         turns, set_turns,
         stream_state, set_stream_state,
         pending_gen, set_pending_gen,
+        calib_results, set_calib_results,
     )
 
 
@@ -195,11 +206,13 @@ def __(mo, DEFAULT_LAYER_IDX, DEFAULT_MAX_NEW_TOKENS, LAYER_RANGE):
     entropy_threshold_slider = mo.ui.slider(
         start=1.0, stop=8.0, step=0.5, value=4.0, label="Entropy threshold (nats)",
     )
+    calib_btn = mo.ui.run_button(label="🔬 Run layer calibration")
 
     return (
         model_name_input, quantization_dropdown, load_btn,
         layer_slider, temperature_slider, max_tokens_slider,
         checkpoint_slider, noise_threshold_slider, entropy_threshold_slider,
+        calib_btn,
     )
 
 
@@ -261,6 +274,11 @@ def __(mo, scenario_dropdown, get_scenario_by_name):
         if (_scenario and _scenario.challenge_prompts)
         else ""
     )
+    _default_rec = (
+        _scenario.recovery_prompts[0]
+        if (_scenario and _scenario.recovery_prompts)
+        else ""
+    )
 
     baseline_input = mo.ui.text_area(
         value=_default_base,
@@ -276,10 +294,21 @@ def __(mo, scenario_dropdown, get_scenario_by_name):
         rows=3,
         full_width=True,
     )
+    recovery_input = mo.ui.text_area(
+        value=_default_rec,
+        label="Recovery prompt",
+        placeholder="Enter a neutral follow-up to test topology recovery…",
+        rows=3,
+        full_width=True,
+    )
     run_baseline_btn = mo.ui.run_button(label="▶ Run baseline")
     run_challenge_btn = mo.ui.run_button(label="▶ Run challenge")
+    run_recovery_btn = mo.ui.run_button(label="▶ Run recovery")
 
-    return baseline_input, challenge_input, run_baseline_btn, run_challenge_btn
+    return (
+        baseline_input, challenge_input, recovery_input,
+        run_baseline_btn, run_challenge_btn, run_recovery_btn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -327,6 +356,30 @@ def __(mo, run_challenge_btn, challenge_input, turns, set_pending_gen):
 
 
 # ---------------------------------------------------------------------------
+# Cell 10b: Recovery button handler
+# Identical flow to the challenge handler but labels the turn "recovery".
+# ---------------------------------------------------------------------------
+
+@app.cell
+def __(mo, run_recovery_btn, recovery_input, turns, set_pending_gen):
+    mo.stop(not run_recovery_btn.value)
+    _prompt = recovery_input.value.strip()
+    mo.stop(not _prompt or not turns)
+
+    _prev = turns[-1]
+    _history = list(_prev["messages"])
+    _history.append({"role": "assistant", "content": _prev["response_text"]})
+    _history.append({"role": "user", "content": _prompt})
+
+    set_pending_gen({
+        "role": "recovery",
+        "prompt": _prompt,
+        "messages": _history,
+    })
+    return ()
+
+
+# ---------------------------------------------------------------------------
 # Cell 11: Async streaming generator
 # This cell re-executes when pending_gen changes (i.e. when a run button is
 # clicked).  It streams token checkpoints into stream_state, then appends the
@@ -340,7 +393,7 @@ async def __(
     layer_slider, temperature_slider, max_tokens_slider, checkpoint_slider,
     noise_threshold_slider,
     set_stream_state, set_turns,
-    compute_persistence,
+    compute_persistence, compute_dimensionality_profile,
 ):
     mo.stop(pending_gen is None)
     mo.stop(handler_state is None)
@@ -387,6 +440,12 @@ async def __(
             noise_threshold=noise_threshold_slider.value,
         )
 
+        _all_embs_for_profile = np.vstack([
+            _final_cp.prompt_embeddings,
+            _final_cp.response_embeddings,
+        ])
+        _dim_profile = compute_dimensionality_profile(_all_embs_for_profile)
+
         _turn = {
             "role": _role,
             "prompt": _prompt,
@@ -397,6 +456,7 @@ async def __(
             "token_entropies": _final_cp.token_entropies,
             "response_tokens": _final_cp.tokens_so_far,
             "persistence": _persistence,
+            "dim_profile": _dim_profile,
         }
         set_turns(lambda t: t + [_turn])
 
@@ -604,6 +664,8 @@ def __(
     detect_hallucination,
     interpret_shift_metrics,
     compute_embedding_consistency,
+    compare_dimensionality_profiles,
+    calib_results,
 ):
     if not turns:
         analysis_view = mo.md(
@@ -619,6 +681,16 @@ def __(
             title=f"Persistence — {_last['role']} (latest turn)",
         )
         _pers_parts = [mo.ui.plotly(_pers_fig)]
+
+        # Dimensionality profile for the latest turn
+        if "dim_profile" in _last:
+            _dp = _last["dim_profile"]
+            _pers_parts.append(mo.md(
+                f"**Dimensionality profile (latest turn)**  \n"
+                f"Intrinsic k (85% var): **{_dp.intrinsic_k}**  ·  "
+                f"PC1 variance: **{_dp.pc1_variance:.1%}**  ·  "
+                f"Elbow slope: **{_dp.elbow_slope:.4f}**"
+            ))
 
         if len(turns) >= 2:
             _shift = compute_shift_metrics(
@@ -643,6 +715,26 @@ def __(
                 f"**Severity:** `{_shift.shift_severity}`  \n"
                 f"**Embedding consistency:** {_consistency:.3f}"
             ))
+
+            # Elbow / dimensionality shift comparison
+            if "dim_profile" in turns[-2] and "dim_profile" in turns[-1]:
+                _dim_shift = compare_dimensionality_profiles(
+                    turns[-2]["dim_profile"], turns[-1]["dim_profile"]
+                )
+                _interp_colour = {
+                    "fragmentation": "warn",
+                    "collapse": "danger",
+                    "stable": "success",
+                }.get(_dim_shift.interpretation, "info")
+                _pers_parts.append(mo.callout(mo.md(
+                    f"**Dimensionality shift:** `{_dim_shift.interpretation}`  \n"
+                    f"Δk: **{_dim_shift.delta_intrinsic_k:+d}**  ·  "
+                    f"ΔPC1: **{_dim_shift.pc1_variance_shift:+.1%}**  ·  "
+                    f"Δelbow slope: **{_dim_shift.elbow_shift:+.4f}**  \n"
+                    f"*Fragmentation → gaslighting signal (more dims recruited).  "
+                    f"Collapse → confabulation signal (fewer dims, PC1 dominant).*"
+                ), kind=_interp_colour))
+
             # Qualitative interpretation
             _qual = interpret_shift_metrics(_shift)
             _pers_parts.append(mo.callout(mo.md(_qual), kind="info"))
@@ -704,6 +796,12 @@ def __(
                     np.vstack([turns[_i - 1]["prompt_embeddings"], turns[_i - 1]["response_embeddings"]]),
                     np.vstack([turns[_i]["prompt_embeddings"], turns[_i]["response_embeddings"]]),
                 )
+                _has_dp = "dim_profile" in turns[_i - 1] and "dim_profile" in turns[_i]
+                _ds = (
+                    compare_dimensionality_profiles(
+                        turns[_i - 1]["dim_profile"], turns[_i]["dim_profile"]
+                    ) if _has_dp else None
+                )
                 _all_shifts.append((_i, turns[_i]["role"], _sm))
                 _metrics_rows.append(
                     f"| {_i} | {turns[_i]['role']} "
@@ -715,11 +813,14 @@ def __(
                     f"| {_sm.stability_h0:.1%} "
                     f"| {_sm.stability_h1:.1%} "
                     f"| `{_sm.shift_severity}` "
-                    f"| {_ec:.3f} |"
+                    f"| {_ec:.3f} "
+                    f"| {(_ds.delta_intrinsic_k if _ds else '—'):>4} "
+                    f"| {(f'{_ds.pc1_variance_shift:+.1%}' if _ds else '—'):>7} "
+                    f"| {(_ds.interpretation if _ds else '—')} |"
                 )
             _metrics_md = (
-                "| Turn | Role | W-H0 | W-H1 | W-total | ΔH0 | ΔH1 | Stab-H0 | Stab-H1 | Severity | Emb. Consistency |\n"
-                "|------|------|------|------|---------|-----|-----|---------|---------|----------|------------------|\n"
+                "| Turn | Role | W-H0 | W-H1 | W-total | ΔH0 | ΔH1 | Stab-H0 | Stab-H1 | Severity | Emb. Consistency | Δk | ΔPC1 | Dim shift |\n"
+                "|------|------|------|------|---------|-----|-----|---------|---------|----------|------------------|-----|------|----------|\n"
                 + "\n".join(_metrics_rows)
             )
             _qual_parts = []
@@ -808,9 +909,85 @@ def __(
             ),
         ])
 
+        # --- Layer calibration results (populated by calibration cell) -----
+        if calib_results is not None:
+            import plotly.graph_objects as _go
+            _layers = sorted(calib_results.keys())
+            _dk_vals = [calib_results[l].delta_intrinsic_k for l in _layers]
+            _interps = [calib_results[l].interpretation for l in _layers]
+            _colours = [
+                {"fragmentation": "#f59e0b", "collapse": "#ef4444", "stable": "#10b981"}.get(i, "#6b7280")
+                for i in _interps
+            ]
+            _bar = _go.Figure(_go.Bar(
+                x=[f"Layer {l}" for l in _layers],
+                y=_dk_vals,
+                marker_color=_colours,
+                text=[f"Δk={v:+d} ({i})" for v, i in zip(_dk_vals, _interps)],
+                textposition="outside",
+            ))
+            _bar.update_layout(
+                title="Layer calibration — Δintrinsic_k (baseline → challenge)",
+                yaxis_title="Δk (positive = fragmentation)",
+                plot_bgcolor="white",
+                height=380,
+            )
+            _best_layer = max(_layers, key=lambda l: abs(calib_results[l].delta_intrinsic_k))
+            _tab_contents["Layer calibration"] = mo.vstack([
+                mo.callout(mo.md(
+                    f"Recommended layer: **{_best_layer}** "
+                    f"(largest |Δk| = {abs(calib_results[_best_layer].delta_intrinsic_k):+d}, "
+                    f"{calib_results[_best_layer].interpretation})"
+                ), kind="success"),
+                mo.ui.plotly(_bar),
+                mo.md(
+                    "**How to read this:** bars show how many extra PCA components are needed "
+                    "to explain 85% of variance after the challenge turn compared to the baseline.  \n"
+                    "A large positive bar → the model recruited more dimensions (conflict / fragmentation).  \n"
+                    "A large negative bar → the model collapsed to fewer dimensions (confabulation).  \n"
+                    "The layer with the largest absolute shift is where the effect is geometrically active."
+                ),
+            ])
+
         analysis_view = mo.tabs(_tab_contents)
 
     return (analysis_view,)
+
+
+# ---------------------------------------------------------------------------
+# Cell 14b: Async layer-calibration runner
+# Fires when calib_btn is pressed.  Runs two forward passes (one per turn)
+# across layers [16, 20, 24, 27] and stores Δk per layer in calib_results.
+# ---------------------------------------------------------------------------
+
+@app.cell
+async def __(
+    mo, asyncio,
+    calib_btn, handler_state, turns,
+    compute_dimensionality_profile, compare_dimensionality_profiles,
+    set_calib_results,
+):
+    mo.stop(not calib_btn.value)
+    mo.stop(handler_state is None or len(turns) < 2)
+
+    _handler = handler_state
+    _layers = [16, 20, 24, 27]
+
+    def _run_calibration():
+        _t0_text = _handler.format_prompt(turns[-2]["messages"])
+        _t1_text = _handler.format_prompt(turns[-1]["messages"])
+        _embs0 = _handler.extract_embeddings_multi_layer(_t0_text, _layers)
+        _embs1 = _handler.extract_embeddings_multi_layer(_t1_text, _layers)
+        results = {}
+        for _l in _layers:
+            _p0 = compute_dimensionality_profile(_embs0[_l])
+            _p1 = compute_dimensionality_profile(_embs1[_l])
+            results[_l] = compare_dimensionality_profiles(_p0, _p1)
+        return results
+
+    _calib = await asyncio.to_thread(_run_calibration)
+    set_calib_results(_calib)
+    return ()
 
 
 # ---------------------------------------------------------------------------
@@ -850,6 +1027,7 @@ def __(
     model_name_input, quantization_dropdown, load_btn,
     layer_slider, temperature_slider, max_tokens_slider,
     checkpoint_slider, noise_threshold_slider, entropy_threshold_slider,
+    calib_btn,
     scenario_dropdown,
 ):
     controls_panel = mo.vstack([
@@ -867,6 +1045,8 @@ def __(
         mo.md("## 🔬 Analysis"),
         noise_threshold_slider,
         entropy_threshold_slider,
+        mo.md("*Requires 2+ turns on layers 16/20/24/27:*"),
+        calib_btn,
         mo.md("---"),
         mo.md("## 📋 Scenarios"),
         scenario_dropdown,
@@ -883,7 +1063,8 @@ def __(
     mo,
     status_banner,
     controls_panel,
-    baseline_input, challenge_input, run_baseline_btn, run_challenge_btn,
+    baseline_input, challenge_input, recovery_input,
+    run_baseline_btn, run_challenge_btn, run_recovery_btn,
     live_view,
     animation_view,
     analysis_view,
@@ -902,6 +1083,12 @@ def __(
             disabled=True,
         ) if turns else mo.md("*Run baseline first to unlock challenge.*"),
         run_challenge_btn,
+        mo.md("---"),
+        recovery_input,
+        mo.md(
+            "*Recovery: neutral follow-up turns to measure topology reversion.*"
+        ) if turns else mo.md("*Run baseline first to unlock recovery.*"),
+        run_recovery_btn,
     ])
 
     _main_panel = mo.vstack([
