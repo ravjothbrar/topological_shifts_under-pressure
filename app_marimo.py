@@ -70,6 +70,8 @@ def __():
     from tda_analyzer import (
         compute_persistence,
         compute_persistence_pca,
+        compute_persistence_umap_intermediate,
+        compute_singularity_scores,
         compute_shift_metrics,
         PersistenceResult,
     )
@@ -95,6 +97,8 @@ def __():
         detect_hallucination,
         compute_persistence,
         compute_persistence_pca,
+        compute_persistence_umap_intermediate,
+        compute_singularity_scores,
         compute_shift_metrics,
         PersistenceResult,
         plot_persistence_diagram,
@@ -194,11 +198,17 @@ def __(mo, DEFAULT_LAYER_IDX, DEFAULT_MAX_NEW_TOKENS, LAYER_RANGE):
     entropy_threshold_slider = mo.ui.slider(
         start=1.0, stop=8.0, step=0.5, value=4.0, label="Entropy threshold (nats)",
     )
+    umap_color_dropdown = mo.ui.dropdown(
+        options={"Stage": "stage", "HADES singularity score": "hades"},
+        value="Stage",
+        label="UMAP colour mode",
+    )
 
     return (
         model_name_input, quantization_dropdown, load_btn,
         layer_slider, temperature_slider, max_tokens_slider,
         checkpoint_slider, noise_threshold_slider, entropy_threshold_slider,
+        umap_color_dropdown,
     )
 
 
@@ -339,7 +349,7 @@ async def __(
     layer_slider, temperature_slider, max_tokens_slider, checkpoint_slider,
     noise_threshold_slider,
     set_stream_state, set_turns,
-    compute_persistence,
+    compute_persistence_umap_intermediate, compute_singularity_scores,
 ):
     mo.stop(pending_gen is None)
     mo.stop(handler_state is None)
@@ -375,16 +385,20 @@ async def __(
         set_stream_state(lambda s: {**s, "is_generating": False, "error": str(_exc)})
         return ()
 
-    # Compute final persistence on the complete embedding point cloud.
+    # Compute final persistence and HADES scores on the complete embedding
+    # point cloud.  Both operate on the original 4096-D embeddings:
+    #   - persistence uses UMAP→50D→ripser (topology-preserving)
+    #   - HADES scores local SVD spectral entropy in the native space
     if _final_cp is not None and _final_cp.response_embeddings.shape[0] > 0:
         _all_embs = np.vstack([
             _final_cp.prompt_embeddings,
             _final_cp.response_embeddings,
         ])
-        _persistence = compute_persistence(
+        _persistence = compute_persistence_umap_intermediate(
             _all_embs,
             noise_threshold=noise_threshold_slider.value,
         )
+        _hades_scores = compute_singularity_scores(_all_embs)
 
         _turn = {
             "role": _role,
@@ -396,6 +410,7 @@ async def __(
             "token_entropies": _final_cp.token_entropies,
             "response_tokens": _final_cp.tokens_so_far,
             "persistence": _persistence,
+            "hades_scores": _hades_scores,
         }
         set_turns(lambda t: t + [_turn])
 
@@ -597,6 +612,7 @@ def __(
     mo, np,
     turns,
     entropy_threshold_slider,
+    umap_color_dropdown,
     plot_persistence_diagram, plot_persistence_comparison,
     compute_umap, plot_umap, plot_token_entropy,
     compute_shift_metrics,
@@ -643,20 +659,55 @@ def __(
         _tab_contents["Persistence"] = mo.vstack(_pers_parts)
 
         # --- UMAP projection -----------------------------------------------
-        _emb_list, _labels = [], []
+        # Collect flat per-point arrays: embeddings, stage labels, HADES scores.
+        _flat_embs, _flat_pt_labels, _flat_hades = [], [], []
         for _t in turns:
-            _emb_list.append(_t["prompt_embeddings"])
-            _labels.append(f"{_t['role']}_prompt")
-            _emb_list.append(_t["response_embeddings"])
-            _labels.append(f"{_t['role']}_response")
+            _n_p = _t["prompt_embeddings"].shape[0]
+            _n_r = _t["response_embeddings"].shape[0]
+            _flat_embs.append(_t["prompt_embeddings"])
+            _flat_pt_labels.extend([f"{_t['role']}_prompt"] * _n_p)
+            _flat_embs.append(_t["response_embeddings"])
+            _flat_pt_labels.extend([f"{_t['role']}_response"] * _n_r)
+            # HADES scores stored per turn as (n_prompt + n_response,) array.
+            _hs = _t.get("hades_scores")
+            if _hs is not None and len(_hs) >= _n_p + _n_r:
+                _flat_hades.extend(_hs[:_n_p].tolist())
+                _flat_hades.extend(_hs[_n_p : _n_p + _n_r].tolist())
+            else:
+                _flat_hades.extend([0.0] * (_n_p + _n_r))
 
-        _valid = [(e, l) for e, l in zip(_emb_list, _labels) if e.shape[0] > 0]
-        if _valid:
-            _ve, _vl = zip(*_valid)
-            _coords, _pt_labels = compute_umap(list(_ve), list(_vl))
-            if _coords.shape[0] > 0:
-                _umap_fig = plot_umap(_coords, _pt_labels, title="UMAP — all turns")
-                _tab_contents["UMAP"] = mo.ui.plotly(_umap_fig)
+        _valid_embs = [e for e in _flat_embs if e.shape[0] > 0]
+        if _valid_embs:
+            _combined = np.vstack(_valid_embs)
+            if _combined.shape[0] >= 5:
+                _coords, _ = compute_umap(
+                    [_combined], ["_"],
+                    n_neighbors=min(15, _combined.shape[0] - 1),
+                )
+                _hades_arr = np.array(_flat_hades, dtype=np.float32) if _flat_hades else None
+                _color_by = umap_color_dropdown.value
+                _umap_fig = plot_umap(
+                    _coords, _flat_pt_labels,
+                    title="UMAP — all turns",
+                    hades_scores=_hades_arr,
+                    color_by=_color_by,
+                )
+                _umap_parts = [mo.ui.plotly(_umap_fig)]
+                if _color_by == "hades" and _hades_arr is not None:
+                    _top_n = min(10, len(_flat_pt_labels))
+                    _top_idx = np.argsort(_hades_arr)[::-1][:_top_n]
+                    _top_labels = [_flat_pt_labels[j] for j in _top_idx]
+                    _umap_parts.append(mo.callout(
+                        mo.md(
+                            "**Most singular points** (highest HADES score):  \n"
+                            + "  \n".join(
+                                f"- `{_top_labels[ii]}` — score {_hades_arr[_top_idx[ii]]:.3f}"
+                                for ii in range(len(_top_idx))
+                            )
+                        ),
+                        kind="warn",
+                    ))
+                _tab_contents["UMAP"] = mo.vstack(_umap_parts)
 
         # --- Entropy + hallucination ---------------------------------------
         _ent_parts = []
@@ -838,6 +889,7 @@ def __(
     model_name_input, quantization_dropdown, load_btn,
     layer_slider, temperature_slider, max_tokens_slider,
     checkpoint_slider, noise_threshold_slider, entropy_threshold_slider,
+    umap_color_dropdown,
     scenario_dropdown,
 ):
     controls_panel = mo.vstack([
@@ -855,6 +907,7 @@ def __(
         mo.md("## 🔬 Analysis"),
         noise_threshold_slider,
         entropy_threshold_slider,
+        umap_color_dropdown,
         mo.md("---"),
         mo.md("## 📋 Scenarios"),
         scenario_dropdown,

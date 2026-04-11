@@ -34,6 +34,7 @@ from ripser import ripser
 from persim import wasserstein, PersistenceImager
 from scipy.spatial.distance import pdist, squareform
 from sklearn.decomposition import PCA
+from sklearn.neighbors import NearestNeighbors
 
 
 # ---------------------------------------------------------------------------
@@ -239,6 +240,207 @@ def compute_persistence_pca(
         subsample=subsample,
     )
     return result, pca_coords
+
+
+# ---------------------------------------------------------------------------
+# HADES: per-point singularity scoring
+# ---------------------------------------------------------------------------
+
+def compute_singularity_scores(
+    embeddings: np.ndarray,
+    k: int = 15,
+    subsample: int | None = 500,
+    random_state: int = 42,
+) -> np.ndarray:
+    """HADES-style per-point singularity score via local spectral entropy.
+
+    For each point we examine its *k* nearest neighbours, centre the
+    neighbourhood, and perform a thin SVD.  The *spectral entropy* of the
+    squared singular values (i.e. the local variance-explained fractions)
+    measures how spread the local variance is across directions:
+
+    * **Smooth manifold point** — variance concentrates in a small number of
+      directions (the local tangent space); spectral entropy is low → score ≈ 0.
+    * **Cusp, fold, or manifold intersection** — variance distributes across
+      many directions simultaneously; spectral entropy is high → score ≈ 1.
+
+    This operates directly on the original high-dimensional embeddings
+    (e.g. 4096-D) *before* any global compression, so the delicate local
+    geometry is intact.
+
+    Parameters
+    ----------
+    embeddings : (n_points, n_features)
+        Raw high-dimensional token embeddings.
+    k : int
+        Number of nearest neighbours for the local patch.
+    subsample : int | None
+        If ``n_points > subsample``, randomly subsample before computing.
+        Non-sampled points receive the score of their nearest sampled
+        neighbour (fast look-up).  Set to ``None`` to disable.
+    random_state : int
+        RNG seed for reproducible subsampling.
+
+    Returns
+    -------
+    scores : np.ndarray, shape (n_points,), dtype float32
+        Singularity score in [0, 1].  0 = smooth manifold; 1 = maximally
+        singular (all directions equally active).
+    """
+    pts = np.asarray(embeddings, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+    n, d = pts.shape
+
+    if n < 3:
+        return np.zeros(n, dtype=np.float32)
+
+    rng = np.random.RandomState(random_state)
+
+    # --- Subsample if needed -----------------------------------------------
+    if subsample is not None and n > subsample:
+        sample_idx = rng.choice(n, size=subsample, replace=False)
+        sample_pts = pts[sample_idx]
+        did_subsample = True
+    else:
+        sample_idx = np.arange(n)
+        sample_pts = pts
+        did_subsample = False
+
+    n_s = sample_pts.shape[0]
+    effective_k = min(k, n_s - 1)
+
+    # --- k-NN on the sampled set -------------------------------------------
+    nn = NearestNeighbors(n_neighbors=effective_k + 1, algorithm="auto", metric="euclidean")
+    nn.fit(sample_pts)
+    _, indices = nn.kneighbors(sample_pts)
+    # indices[:, 0] is the query point itself; take the true neighbours.
+    nbr_indices = indices[:, 1 : effective_k + 1]
+
+    # --- Local SVD → spectral entropy per sampled point --------------------
+    sample_scores = np.zeros(n_s, dtype=np.float64)
+    log_k = np.log(effective_k) if effective_k > 1 else 1.0
+
+    for i in range(n_s):
+        nbrs = sample_pts[nbr_indices[i]]          # (effective_k, d)
+        centered = nbrs - sample_pts[i]            # centre on query point
+        # Thin SVD: only compute the min(effective_k, d) singular values.
+        svals = np.linalg.svd(centered, compute_uv=False, full_matrices=False)
+        variances = svals ** 2
+        total = variances.sum()
+        if total < 1e-12:
+            # Degenerate neighbourhood — treat as perfectly smooth.
+            sample_scores[i] = 0.0
+            continue
+        p = variances / total
+        # Spectral entropy, normalised to [0, 1] by dividing by log(k).
+        eps = 1e-12
+        H = -np.sum(p * np.log(p + eps))
+        sample_scores[i] = np.clip(H / log_k, 0.0, 1.0)
+
+    if not did_subsample:
+        return sample_scores.astype(np.float32)
+
+    # --- Propagate scores to non-sampled points via 1-NN ------------------
+    nn_full = NearestNeighbors(n_neighbors=1, algorithm="auto", metric="euclidean")
+    nn_full.fit(sample_pts)
+    _, nn_idx = nn_full.kneighbors(pts)
+    all_scores = sample_scores[nn_idx[:, 0]].astype(np.float32)
+    # Sampled points keep their own computed score (overrides NN look-up).
+    all_scores[sample_idx] = sample_scores.astype(np.float32)
+    return all_scores
+
+
+# ---------------------------------------------------------------------------
+# Topology-preserving persistence via UMAP intermediate reduction
+# ---------------------------------------------------------------------------
+
+def compute_persistence_umap_intermediate(
+    embeddings: np.ndarray,
+    n_umap_components: int = 50,
+    noise_threshold: float = 0.0,
+    subsample: int | None = 300,
+    umap_n_neighbors: int = 15,
+    random_state: int = 42,
+) -> PersistenceResult:
+    """Topology-preserving persistence via UMAP intermediate reduction.
+
+    Rather than crushing 4096-D embeddings to 3-D with PCA (which destroys
+    most topological structure) or running ripser directly in 4096-D (where
+    the curse of dimensionality collapses all pairwise distances), this
+    function:
+
+    1. Reduces to *n_umap_components* (default 50) with UMAP — a manifold-
+       aware projection that faithfully preserves both local neighbourhood
+       structure and global topology.
+    2. Uses ``min_dist=0.0`` so UMAP compresses clusters tightly and
+       distances inside the embedding remain geometrically meaningful for
+       the Vietoris-Rips filtration.
+    3. Runs Vietoris-Rips persistence on the 50-D point cloud, where
+       inter-point distances are informative and the filtration is sensitive
+       to genuine H0/H1 features.
+
+    **Not suitable for real-time streaming** (UMAP fitting takes ~1–5 s for
+    300 points in 4096-D).  Use :func:`compute_persistence_pca` there.
+
+    Parameters
+    ----------
+    embeddings : (n_points, n_features)
+        Raw high-dimensional token embeddings.
+    n_umap_components : int
+        Target UMAP dimensionality.  50 is a good default: high enough to
+        preserve topology, low enough for fast ripser.
+    noise_threshold : float
+        Minimum persistence to keep a feature.
+    subsample : int | None
+        Randomly subsample to at most this many points before UMAP.
+    umap_n_neighbors : int
+        UMAP ``n_neighbors`` — controls the local vs. global balance.
+    random_state : int
+        RNG seed for UMAP and subsampling.
+
+    Returns
+    -------
+    PersistenceResult
+    """
+    from umap import UMAP
+
+    pts = np.asarray(embeddings, dtype=np.float64)
+    if pts.ndim == 1:
+        pts = pts.reshape(1, -1)
+
+    if pts.shape[0] < 2:
+        empty = np.empty((0, 2))
+        return PersistenceResult(diagrams=[empty, empty])
+
+    # Subsample before UMAP to keep fit time bounded.
+    if subsample is not None and pts.shape[0] > subsample:
+        rng = np.random.RandomState(random_state)
+        idx = rng.choice(pts.shape[0], size=subsample, replace=False)
+        pts = pts[idx]
+
+    n_pts = pts.shape[0]
+    n_components = min(n_umap_components, n_pts - 1, pts.shape[1])
+    effective_neighbors = min(umap_n_neighbors, max(2, n_pts - 1))
+
+    reducer = UMAP(
+        n_neighbors=effective_neighbors,
+        n_components=n_components,
+        # min_dist=0 maximises local compactness — distances become more
+        # faithful to the intrinsic manifold, which benefits ripser.
+        min_dist=0.0,
+        random_state=random_state,
+    )
+    reduced = reducer.fit_transform(pts)
+
+    # Subsample already applied; pass subsample=None so compute_persistence
+    # does not subsample again.
+    return compute_persistence(
+        reduced,
+        max_dim=1,
+        noise_threshold=noise_threshold,
+        subsample=None,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -29,6 +29,8 @@ from model_handler import (
 )
 from tda_analyzer import (
     compute_persistence,
+    compute_persistence_umap_intermediate,
+    compute_singularity_scores,
     compute_shift_metrics,
     PersistenceResult,
     TopologicalShiftMetrics,
@@ -63,6 +65,7 @@ _DEFAULTS: dict[str, object] = {
     "turns": [],            # list[ConversationTurn]
     "persistence": [],      # list[PersistenceResult]  (parallel to turns)
     "shift_metrics": [],    # list[TopologicalShiftMetrics | None]
+    "hades_scores": [],     # list[np.ndarray]  per-point singularity scores
 }
 
 for key, default in _DEFAULTS.items():
@@ -149,7 +152,7 @@ with st.sidebar:
     reset = col_r.button("Reset")
 
     if reset:
-        for key in ("turns", "persistence", "shift_metrics"):
+        for key in ("turns", "persistence", "shift_metrics", "hades_scores"):
             st.session_state[key] = []
         st.rerun()
 
@@ -196,10 +199,18 @@ def _run_turn(prompt: str, role: str) -> None:
     turn = ConversationTurn(role=role, prompt=prompt, result=result, messages=messages)
     st.session_state["turns"].append(turn)
 
-    # Persistence on full embeddings
-    with st.spinner("Computing persistence diagram …"):
-        pr = compute_persistence(result.full_embeddings)
+    # Persistence via UMAP-intermediate reduction (topology-preserving).
+    # Using UMAP→50D→ripser instead of raw 4096-D (curse of dimensionality)
+    # or 3-D PCA (destroys loops and clusters).
+    with st.spinner("Computing UMAP-intermediate persistence …"):
+        pr = compute_persistence_umap_intermediate(result.full_embeddings)
     st.session_state["persistence"].append(pr)
+
+    # HADES singularity scores — computed on the original high-dim embeddings
+    # before any global compression, so delicate local geometry is intact.
+    with st.spinner("Computing HADES singularity scores …"):
+        hs = compute_singularity_scores(result.full_embeddings)
+    st.session_state["hades_scores"].append(hs)
 
     # Shift metrics vs. previous turn (if any)
     persis = st.session_state["persistence"]
@@ -350,43 +361,23 @@ with tab_persistence:
 # ---- UMAP tab ------------------------------------------------------------
 
 with tab_umap:
-    # Collect embeddings + labels from all turns
-    emb_list: list[np.ndarray] = []
-    label_list: list[str] = []
-    all_tokens_flat: list[str] = []
+    umap_color_mode = st.radio(
+        "Colour by",
+        ["Stage", "HADES singularity score"],
+        horizontal=True,
+        help=(
+            "**Stage** — colour points by conversation role (baseline/challenge).  "
+            "**HADES singularity score** — continuous red (singular) → blue (smooth) "
+            "scale computed on the raw 4096-D embeddings before any compression."
+        ),
+    )
 
-    for i, t in enumerate(turns):
-        if t.result is None:
-            continue
-        r = t.result
-        stage_prefix = t.role  # "baseline" or "challenge"
-
-        # Mark high-uncertainty response tokens
-        _, _, flagged_idx = detect_hallucination(r, entropy_threshold=entropy_threshold)
-        flagged_set = set(flagged_idx)
-
-        # Prompt embeddings
-        emb_list.append(r.prompt_embeddings)
-        label_list.append(f"{stage_prefix}_prompt")
-        all_tokens_flat.extend(r.prompt_tokens)
-
-        # Response embeddings – split normal vs. high-uncertainty
-        resp_labels = []
-        for j in range(r.response_embeddings.shape[0]):
-            if j in flagged_set:
-                resp_labels.append("high_uncertainty")
-            else:
-                resp_labels.append(f"{stage_prefix}_response")
-
-        emb_list.append(r.response_embeddings)
-        label_list.append("__mixed__")  # placeholder – overridden below
-        all_tokens_flat.extend(r.response_tokens)
-
-    # Build flat label array properly (we need per-point labels)
+    # Build flat arrays of embeddings, labels, tokens, and HADES scores.
     flat_embs: list[np.ndarray] = []
     flat_labels: list[str] = []
     flat_tokens: list[str] = []
-    token_cursor = 0
+    flat_hades: list[float] = []
+    all_hades: list[np.ndarray] = st.session_state["hades_scores"]
 
     for i, t in enumerate(turns):
         if t.result is None:
@@ -396,19 +387,33 @@ with tab_umap:
         _, _, flagged_idx = detect_hallucination(r, entropy_threshold=entropy_threshold)
         flagged_set = set(flagged_idx)
 
+        n_prompt = r.prompt_embeddings.shape[0]
+        n_response = r.response_embeddings.shape[0]
+
+        # Retrieve HADES scores for this turn (full_embeddings = prompt + response).
+        if i < len(all_hades):
+            hs = all_hades[i]
+            hs_prompt = hs[:n_prompt]
+            hs_response = hs[n_prompt : n_prompt + n_response]
+        else:
+            hs_prompt = np.zeros(n_prompt, dtype=np.float32)
+            hs_response = np.zeros(n_response, dtype=np.float32)
+
         # Prompt
         flat_embs.append(r.prompt_embeddings)
-        flat_labels.extend([f"{stage_prefix}_prompt"] * r.prompt_embeddings.shape[0])
+        flat_labels.extend([f"{stage_prefix}_prompt"] * n_prompt)
         flat_tokens.extend(r.prompt_tokens)
+        flat_hades.extend(hs_prompt.tolist())
 
         # Response
         flat_embs.append(r.response_embeddings)
-        for j in range(r.response_embeddings.shape[0]):
+        for j in range(n_response):
             if j in flagged_set:
                 flat_labels.append("high_uncertainty")
             else:
                 flat_labels.append(f"{stage_prefix}_response")
         flat_tokens.extend(r.response_tokens)
+        flat_hades.extend(hs_response.tolist())
 
     if flat_embs:
         combined = np.vstack(flat_embs)
@@ -417,8 +422,27 @@ with tab_umap:
             coords, _ = compute_umap(
                 [combined], ["_"], n_neighbors=min(15, combined.shape[0] - 1),
             )
-            fig = plot_umap(coords, flat_labels, tokens=flat_tokens)
+            color_by = "hades" if umap_color_mode == "HADES singularity score" else "stage"
+            hades_arr = np.array(flat_hades, dtype=np.float32) if flat_hades else None
+            fig = plot_umap(
+                coords, flat_labels, tokens=flat_tokens,
+                hades_scores=hades_arr,
+                color_by=color_by,
+            )
             st.plotly_chart(fig, use_container_width=True)
+
+            if color_by == "hades" and hades_arr is not None:
+                # Surface the top-singular tokens so the experimenter can
+                # cross-reference with high-entropy regions.
+                top_n = min(10, len(flat_tokens))
+                top_idx = np.argsort(hades_arr)[::-1][:top_n]
+                st.caption(
+                    "**Most singular tokens** (highest HADES score): "
+                    + ", ".join(
+                        f"`{flat_tokens[j]}` ({hades_arr[j]:.3f})"
+                        for j in top_idx if j < len(flat_tokens)
+                    )
+                )
         else:
             st.warning("Need at least 5 embedding points for UMAP projection.")
     else:

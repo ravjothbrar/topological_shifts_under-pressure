@@ -216,11 +216,33 @@ def plot_umap(
     tokens: list[str] | None = None,
     title: str = "UMAP Embedding Space",
     show_trajectory: bool = True,
+    hades_scores: np.ndarray | None = None,
+    color_by: str = "stage",
 ) -> go.Figure:
     """Interactive 2-D UMAP scatter plot with trajectory lines.
 
-    Points are coloured by conversation stage.  If *tokens* is provided
-    they appear in the hover tooltip.
+    Parameters
+    ----------
+    coords : (n_points, 2)
+        UMAP-projected coordinates.
+    labels : list[str]
+        Per-point stage label (used when ``color_by="stage"``).
+    tokens : list[str] | None
+        Optional per-point token strings shown in hover tooltip.
+    title : str
+        Figure title.
+    show_trajectory : bool
+        Draw a dotted line through stage centroids.
+    hades_scores : np.ndarray | None, shape (n_points,)
+        Per-point HADES singularity scores in [0, 1].  Required when
+        ``color_by="hades"``.
+    color_by : {"stage", "hades"}
+        Colouring mode.
+
+        * ``"stage"`` — colour by conversation stage (default).
+        * ``"hades"`` — continuous colourscale from smooth (blue) to
+          singular (red) using the HADES singularity scores.  Stage colours
+          are shown as a faint background; a colourbar is added.
     """
     fig = go.Figure()
 
@@ -228,42 +250,103 @@ def plot_umap(
         fig.update_layout(title=title, template="plotly_white")
         return fig
 
-    unique_labels = list(dict.fromkeys(labels))  # preserve order
+    unique_labels = list(dict.fromkeys(labels))
 
-    # Per-stage scatter
-    start_idx = 0
+    # Compute stage centroids regardless of colour mode (needed for trajectory).
     stage_centroids: list[tuple[float, float]] = []
-
     for stage in unique_labels:
         mask = np.array([l == stage for l in labels])
-        pts = coords[mask]
-        color = STAGE_COLORS.get(stage, "#999")
-        display = STAGE_LABELS.get(stage, stage)
-
-        hover: list[str] | None = None
-        if tokens is not None:
-            hover = [tokens[i] for i, m in enumerate(mask) if m]
-
-        fig.add_trace(go.Scatter(
-            x=pts[:, 0],
-            y=pts[:, 1],
-            mode="markers",
-            marker=dict(size=6, color=color, opacity=0.75,
-                        line=dict(width=0.5, color="white")),
-            name=display,
-            text=hover,
-            hovertemplate=(
-                "Token: %{text}<br>x: %{x:.2f}<br>y: %{y:.2f}"
-                "<extra></extra>"
-            ) if hover else None,
-        ))
-
-        if pts.shape[0] > 0:
+        pts_s = coords[mask]
+        if pts_s.shape[0] > 0:
             stage_centroids.append(
-                (float(pts[:, 0].mean()), float(pts[:, 1].mean()))
+                (float(pts_s[:, 0].mean()), float(pts_s[:, 1].mean()))
             )
 
-    # Trajectory line through stage centroids
+    # ------------------------------------------------------------------ #
+    # Mode A: HADES singularity score colouring                           #
+    # ------------------------------------------------------------------ #
+    if color_by == "hades" and hades_scores is not None:
+        scores = np.asarray(hades_scores, dtype=np.float32)
+        # Faint stage-colour background so context is not lost entirely.
+        for stage in unique_labels:
+            mask = np.array([l == stage for l in labels])
+            pts_s = coords[mask]
+            if pts_s.shape[0] == 0:
+                continue
+            fig.add_trace(go.Scatter(
+                x=pts_s[:, 0],
+                y=pts_s[:, 1],
+                mode="markers",
+                marker=dict(
+                    size=10,
+                    color=STAGE_COLORS.get(stage, "#999"),
+                    opacity=0.12,
+                ),
+                name=STAGE_LABELS.get(stage, stage),
+                showlegend=True,
+                hoverinfo="skip",
+            ))
+
+        # Foreground: colour by HADES score.
+        hover_tpl = (
+            "Score: %{marker.color:.3f}<br>Token: %{text}<br>"
+            "x: %{x:.2f}<br>y: %{y:.2f}<extra></extra>"
+        ) if tokens else (
+            "Score: %{marker.color:.3f}<br>x: %{x:.2f}<br>y: %{y:.2f}<extra></extra>"
+        )
+        fig.add_trace(go.Scatter(
+            x=coords[:, 0],
+            y=coords[:, 1],
+            mode="markers",
+            marker=dict(
+                size=7,
+                color=scores,
+                colorscale="RdYlBu_r",   # red = singular, blue = smooth
+                cmin=0.0,
+                cmax=1.0,
+                colorbar=dict(
+                    title="Singularity<br>Score",
+                    thickness=14,
+                    tickvals=[0.0, 0.5, 1.0],
+                    ticktext=["smooth", "0.5", "singular"],
+                ),
+                opacity=0.85,
+                line=dict(width=0.5, color="rgba(255,255,255,0.6)"),
+            ),
+            name="HADES score",
+            text=tokens,
+            hovertemplate=hover_tpl,
+        ))
+
+    # ------------------------------------------------------------------ #
+    # Mode B: Stage colouring (default)                                   #
+    # ------------------------------------------------------------------ #
+    else:
+        for stage in unique_labels:
+            mask = np.array([l == stage for l in labels])
+            pts_s = coords[mask]
+            color = STAGE_COLORS.get(stage, "#999")
+            display = STAGE_LABELS.get(stage, stage)
+
+            hover: list[str] | None = None
+            if tokens is not None:
+                hover = [tokens[i] for i, m in enumerate(mask) if m]
+
+            fig.add_trace(go.Scatter(
+                x=pts_s[:, 0],
+                y=pts_s[:, 1],
+                mode="markers",
+                marker=dict(size=6, color=color, opacity=0.75,
+                            line=dict(width=0.5, color="white")),
+                name=display,
+                text=hover,
+                hovertemplate=(
+                    "Token: %{text}<br>x: %{x:.2f}<br>y: %{y:.2f}"
+                    "<extra></extra>"
+                ) if hover else None,
+            ))
+
+    # Trajectory line through stage centroids (both modes).
     if show_trajectory and len(stage_centroids) > 1:
         cx = [c[0] for c in stage_centroids]
         cy = [c[1] for c in stage_centroids]
